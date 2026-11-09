@@ -21,6 +21,9 @@ def _defaults():
         "opacity": 0.80,           # background alpha only, text stays opaque
         "week_starts_sunday": True,
         "locked": False,           # disable move/resize
+        "carry_mode": "manual",   # auto, manual, or off
+        "carry_lookback_days": 14, # past days checked for open tasks
+        "last_carry": None,        # last successful auto carry, ISO date
     }
 
 

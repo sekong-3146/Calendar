@@ -6,11 +6,12 @@ from urllib.parse import quote
 
 from PySide6.QtCore import QEvent, QRect, QRectF, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (QColor, QDesktopServices, QGuiApplication, QKeySequence, QPainter,
-                           QPalette, QPen, QShortcut)
+                           QPalette, QPen, QShortcut, QTextCursor)
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit, QPushButton,
                                QSizeGrip, QSplitter, QTabWidget, QTextBrowser, QToolButton,
                                QVBoxLayout, QWidget)
 
+from . import tasks
 from .memofile import MemoConflict
 from .winpin import set_topmost
 
@@ -58,6 +59,7 @@ class DayDetail(QWidget):
         self.day = None
         self.notes = []
         self._dirty = False
+        self._ime_preedit = False
         self._base_mtime = None                   # memo file mtime when loaded/saved
         self._notes_sig = []
         self.topmost = False                      # follows the calendar while Win+D desktop is shown
@@ -74,6 +76,8 @@ class DayDetail(QWidget):
 
         self.memo = QPlainTextEdit()
         self.memo.installEventFilter(self)
+        self.memo.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.memo.customContextMenuRequested.connect(self._memo_context_menu)
         self.memo.setPlaceholderText("메모를 입력하세요 (자동 저장)")
         self.memo.textChanged.connect(self._on_edit)
         memo_box = QWidget()
@@ -116,6 +120,7 @@ class DayDetail(QWidget):
         QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self.close)
         QShortcut(QKeySequence("Ctrl+Left"), self, activated=lambda: self._shift_day(-1))
         QShortcut(QKeySequence("Ctrl+Right"), self, activated=lambda: self._shift_day(1))
+        QShortcut(QKeySequence("Ctrl+L"), self, activated=self._toggle_task_lines)
         self.resize(560, 640)
 
     # data
@@ -137,10 +142,148 @@ class DayDetail(QWidget):
     def eventFilter(self, watched, event):
         if (event.type() == QEvent.ShortcutOverride
                 and event.modifiers() == Qt.ControlModifier
-                and event.key() in (Qt.Key_Left, Qt.Key_Right)):
-            event.ignore()       # Let day shortcuts override the editor's word navigation.
+                and (event.key() in (Qt.Key_Left, Qt.Key_Right)
+                     or (watched is self.memo and event.key() == Qt.Key_L))):
+            event.ignore()       # Let window shortcuts override editor commands.
             return True
+        if watched is self.memo:
+            if event.type() == QEvent.InputMethod:
+                self._ime_preedit = bool(event.preeditString())
+            elif (event.type() == QEvent.KeyPress
+                  and event.key() in (Qt.Key_Return, Qt.Key_Enter)
+                  and event.modifiers() == Qt.NoModifier
+                  and self._continue_task()):
+                return True
         return super().eventFilter(watched, event)
+
+    @staticmethod
+    def _replace_block_text(cursor, block, text):
+        old = block.text()
+        prefix = 0
+        while prefix < min(len(old), len(text)) and old[prefix] == text[prefix]:
+            prefix += 1
+        suffix = 0
+        while (suffix < min(len(old), len(text)) - prefix
+               and old[-suffix - 1] == text[-suffix - 1]):
+            suffix += 1
+        old_end = len(old) - suffix
+        new_end = len(text) - suffix
+        # Qt positions count UTF-16 units, not Python characters.
+        start = block.position() + len(old[:prefix].encode("utf-16-le")) // 2
+        end = block.position() + len(old[:old_end].encode("utf-16-le")) // 2
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.KeepAnchor)
+        cursor.insertText(text[prefix:new_end])
+
+    def _apply_task_lines(self, transform):
+        if self.memo.isReadOnly():
+            return
+        QGuiApplication.inputMethod().commit()
+        saved = self.memo.textCursor()
+        doc = self.memo.document()
+        first = doc.findBlock(saved.selectionStart()).blockNumber()
+        last_block = doc.findBlock(saved.selectionEnd())
+        last = last_block.blockNumber()
+        if saved.hasSelection() and saved.selectionEnd() == last_block.position():
+            last -= 1
+        lines = self.memo.toPlainText().split("\n")
+        mask = tasks.editable_mask(lines)
+        changes = []
+        for line_no in range(first, last + 1):
+            if mask[line_no]:
+                text = transform(lines[line_no])
+                if text != lines[line_no]:
+                    changes.append((line_no, text))
+        if not changes:
+            return
+        cursor = QTextCursor(doc)
+        cursor.beginEditBlock()
+        try:
+            for line_no, text in changes:
+                self._replace_block_text(cursor, doc.findBlockByNumber(line_no), text)
+        finally:
+            cursor.endEditBlock()
+        self.memo.setTextCursor(saved)
+
+    def _toggle_task_lines(self):
+        if self.memo.hasFocus():
+            self._apply_task_lines(tasks.toggle_line)
+
+    def _mark_task_lines(self, mark):
+        def transform(line):
+            task = tasks.parse_task(line)
+            if task and ((mark == tasks.DONE and task.is_open)
+                         or (mark == tasks.OPEN and task.is_done)):
+                return tasks.set_mark(line, mark)
+            return line
+        self._apply_task_lines(transform)
+
+    def _memo_context_menu(self, pos):
+        menu = self.memo.createStandardContextMenu()
+        menu.addSeparator()
+        commands = (
+            ("할 일로 만들기 (Ctrl+L)", lambda: self._apply_task_lines(tasks.make_task)),
+            ("완료 표시", lambda: self._mark_task_lines(tasks.DONE)),
+            ("완료 해제", lambda: self._mark_task_lines(tasks.OPEN)),
+            ("체크박스 제거", lambda: self._apply_task_lines(tasks.make_plain)),
+        )
+        for text, handler in commands:
+            action = menu.addAction(text)
+            action.setEnabled(not self.memo.isReadOnly())
+            action.triggered.connect(handler)
+        try:
+            menu.exec(self.memo.mapToGlobal(pos))
+        finally:
+            menu.deleteLater()
+
+    def _continue_task(self):
+        if self.memo.isReadOnly() or self._ime_preedit:
+            return False
+        cursor = self.memo.textCursor()
+        if cursor.hasSelection() or not cursor.atBlockEnd():
+            return False
+        block = cursor.block()
+        mask = tasks.editable_mask(self.memo.toPlainText().split("\n"))
+        if not mask[block.blockNumber()]:
+            return False
+        prefix = tasks.continuation(block.text())
+        if prefix is None:
+            return False
+        cursor.beginEditBlock()
+        try:
+            if prefix:
+                cursor.insertText("\n" + prefix)
+            else:
+                text = block.text()
+                indent = text[:len(text) - len(text.lstrip(" \t"))]
+                self._replace_block_text(cursor, block, indent)
+        finally:
+            cursor.endEditBlock()
+        self.memo.setTextCursor(cursor)
+        return True
+
+    def toggle_task_at(self, line_no: int, expected_line: str) -> bool:
+        if self.memo.isReadOnly():
+            QMessageBox.warning(self, "MdCal", "읽기 전용 메모는 변경할 수 없습니다.")
+            return False
+        QGuiApplication.inputMethod().commit()
+        block = self.memo.document().findBlockByNumber(line_no)
+        text = block.text()
+        task = tasks.parse_task(text)
+        if (not block.isValid() or text.rstrip("\r") != expected_line.rstrip("\r")
+                or task is None or not (task.is_open or task.is_done)):
+            QMessageBox.warning(self, "MdCal", "메모 내용이 바뀌었습니다. 다시 시도하세요.")
+            return False
+        saved = self.memo.textCursor()
+        cursor = QTextCursor(self.memo.document())
+        cursor.beginEditBlock()
+        try:
+            self._replace_block_text(cursor, block,
+                                     tasks.set_mark(text, tasks.DONE if task.is_open else tasks.OPEN))
+        finally:
+            cursor.endEditBlock()
+        self.memo.setTextCursor(saved)
+        return True
 
     def _shift_day(self, delta):
         if self.day is not None:

@@ -8,6 +8,7 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QMenu, QSizeGrip, QToolButton, QToolTip,
                                QVBoxLayout, QWidget)
 
+from . import tasks
 from .config import save_config
 from .winpin import BottomPin
 
@@ -50,6 +51,8 @@ def _with_alpha(c: QColor, a: int) -> QColor:
 class GridWidget(QWidget):
     dayActivated = Signal(object)            # date
     colorRequested = Signal(object, object)  # date, "#rrggbb" or None
+    taskToggled = Signal(object, int, str)    # date, body line number, raw line
+    carryRequested = Signal(object)          # source date
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -60,6 +63,9 @@ class GridWidget(QWidget):
         self.data = {}
         self.hover = None
         self._truncated = set()
+        self._task_rects = []                # QRectF, date, body line number, raw line
+        self._pressed_task = None            # Preserve the first click across a rescan.
+        self.carry_menu = True               # False when carry_mode is "off" (set by app)
         self.f_head = QFont(FONT, 9)
         self.f_day = QFont(FONT, 10, QFont.Bold)
         self.f_text = QFont(FONT, 8)
@@ -67,6 +73,8 @@ class GridWidget(QWidget):
     def set_view(self, month, cells, data, sunday_first):
         self.month, self.cells, self.data, self.sunday_first = month, cells, data, sunday_first
         self._truncated.clear()
+        self._task_rects.clear()
+        self.unsetCursor()
         QToolTip.hideText()
         self.update()
 
@@ -112,6 +120,7 @@ class GridWidget(QWidget):
 
         today = date.today()
         self._truncated.clear()
+        self._task_rects.clear()
         for idx, d in enumerate(self.cells):
             self._paint_cell(p, idx, d, today)
 
@@ -139,11 +148,26 @@ class GridWidget(QWidget):
         if not cd:
             return
 
-        lines = [(ln, _with_alpha(C_TEXT, fade)) for ln in cd.memo.splitlines() if ln.strip()]
+        lines = []
+        memo_lines = cd.memo.split("\n")
+        for line_no, (raw, editable) in enumerate(zip(memo_lines, tasks.editable_mask(memo_lines))):
+            if not raw.strip():
+                continue
+            task = tasks.parse_task(raw, line_no) if editable else None
+            text, color, glyph = raw, C_TEXT, ""
+            if task and (task.is_open or task.is_done or task.is_carried):
+                prefix = "☐ " if task.is_open else "☑ " if task.is_done else "→ "
+                text = prefix + task.text
+                if not task.is_open:
+                    color = C_DIM
+                if task.is_open or task.is_done:
+                    glyph = prefix
+            lines.append((text, _with_alpha(color, fade), line_no, raw, glyph))
         for note_lines in cd.md:
             for i, ln in enumerate(note_lines):
-                lines.append(("▸ " + ln, _with_alpha(C_MD, fade)) if i == 0
-                             else ("  · " + ln, _with_alpha(C_MD, int(fade * 0.7))))
+                text = "▸ " + ln if i == 0 else "  · " + ln
+                color = _with_alpha(C_MD, fade if i == 0 else int(fade * 0.7))
+                lines.append((text, color, None, None, ""))
 
         fm = QFontMetrics(self.f_text)
         lh = fm.height()
@@ -151,7 +175,7 @@ class GridWidget(QWidget):
         y, bottom = r.top() + 22, r.bottom() - 2
         p.setFont(self.f_text)
         cut = False
-        for text, color in lines:
+        for text, color, line_no, raw, glyph in lines:
             if y + lh > bottom:
                 cut = True
                 break
@@ -159,6 +183,9 @@ class GridWidget(QWidget):
             cut |= el != text
             p.setPen(color)
             p.drawText(QRectF(x, y, tw, lh), Qt.AlignLeft | Qt.AlignVCenter, el)
+            if glyph and el.startswith(glyph.rstrip()):
+                rect = QRectF(x, y, min(tw, fm.horizontalAdvance(glyph)), lh)
+                self._task_rects.append((rect, d, line_no, raw))
             y += lh
         if cut:      # hint: double-click to see everything
             self._truncated.add(idx)
@@ -180,7 +207,20 @@ class GridWidget(QWidget):
             return True
         return super().event(e)
 
+    def _task_hit(self, pos):
+        return next((entry for entry in self._task_rects if entry[0].contains(pos)), None)
+
+    def mousePressEvent(self, e):
+        hit = self._task_hit(e.position())
+        self._pressed_task = hit if e.button() == Qt.LeftButton else None
+        if e.button() == Qt.LeftButton and hit is not None:
+            self.taskToggled.emit(*hit[1:])
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
     def mouseMoveEvent(self, e):
+        self.setCursor(Qt.PointingHandCursor if self._task_hit(e.position()) else Qt.ArrowCursor)
         idx = self._hit(e.position())
         if idx != self.hover:
             self.hover = idx
@@ -188,10 +228,16 @@ class GridWidget(QWidget):
 
     def leaveEvent(self, _):
         self.hover = None
+        self.unsetCursor()
         self.update()
 
     def mouseDoubleClickEvent(self, e):
         idx = self._hit(e.position())
+        hit = self._task_hit(e.position()) or self._pressed_task
+        if (e.button() == Qt.LeftButton and hit is not None and idx is not None
+                and hit[0].contains(e.position()) and self.cells[idx] == hit[1]):
+            e.accept()
+            return
         if idx is not None and e.button() == Qt.LeftButton:
             self.dayActivated.emit(self.cells[idx])
 
@@ -202,6 +248,10 @@ class GridWidget(QWidget):
         d = self.cells[idx]
         m = QMenu(self)
         m.addAction("열기 / 메모 쓰기", lambda: self.dayActivated.emit(d))
+        cd = self.data.get(d)
+        count = len(tasks.open_tasks(cd.memo)) if self.carry_menu and cd and d < date.today() else 0
+        if count:
+            m.addAction(f"미완료 할 일 오늘로 보내기 ({count}개)", lambda: self.carryRequested.emit(d))
         m.addSeparator()
         for name, hexv in DAY_COLORS:
             m.addAction(name, lambda h=hexv: self.colorRequested.emit(d, h))
@@ -223,6 +273,7 @@ class HeaderBar(QWidget):
 
 class CalendarWindow(QWidget):
     raisedChanged = Signal(bool)     # True while lifted above the Win+D desktop
+    dateChanged = Signal(object)     # new local date, after refreshing the calendar
 
     def __init__(self, cfg, store, index):
         # No WindowStaysOnBottomHint: Qt would block the TOPMOST lift used for Win+D.
@@ -375,6 +426,7 @@ class CalendarWindow(QWidget):
                 self.year, self.month = t.year, t.month
             self._shown_today = t
             self.refresh()
+            self.dateChanged.emit(t)
 
     def paintEvent(self, _):
         p = QPainter(self)

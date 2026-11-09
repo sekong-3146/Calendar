@@ -9,7 +9,7 @@ from PySide6.QtCore import QLockFile, QRectF, Qt
 from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QMessageBox, QSystemTrayIcon
 
-from . import autostart
+from . import autostart, carry, tasks
 from .config import APP_DIR, DB_PATH, LOCK_PATH, load_config, save_config
 from .detail import DayDetail
 from .grid import CalendarWindow
@@ -67,7 +67,11 @@ class App:
         self.detail.saved.connect(lambda _d: self.index.rescan())   # pick up the new file mtime now
         self.win.grid.dayActivated.connect(
             lambda d: self.detail.show_day(d, self.win.grid.cell_global_rect(d)))
+        self.win.grid.taskToggled.connect(self._on_task_toggled)
+        self.win.grid.carryRequested.connect(lambda d: self._run_carry([d], date.today(), manual=True))
+        self.win.dateChanged.connect(lambda _d: self._auto_carry())
         self.win.raisedChanged.connect(self.detail.set_topmost)
+        self.win.grid.carry_menu = self.cfg.get("carry_mode", "manual") != "off"
 
         icon = make_icon()
         qapp.setWindowIcon(icon)
@@ -85,11 +89,95 @@ class App:
         self.index.rescan()
         self.win.show()
         self.tray.show()
+        self._auto_carry()
         self._warn_missing()
         try:
             autostart.refresh()          # project moved -> fix the Run path
         except OSError as e:
             QMessageBox.warning(None, "MdCal", f"자동 실행 경로 갱신 실패\n{e}")
+
+    def _on_task_toggled(self, d, line_no, raw):
+        if not self.memos.enabled:
+            return
+        if self.detail.isVisible() and self.detail.day == d:
+            self.detail.toggle_task_at(line_no, raw)
+            return
+        try:
+            doc = self.memos.read(d)
+            if doc.error:
+                QMessageBox.warning(self.win, "MdCal", f"메모를 수정할 수 없습니다.\n{doc.error}")
+                return
+            new = tasks.toggle_done(doc.body, line_no, raw)
+            self.memos.write(d, new, doc.mtime)
+        except ValueError as e:
+            QMessageBox.warning(self.win, "MdCal", str(e))
+            self.index.rescan()
+            return
+        except MemoConflict:
+            QMessageBox.warning(self.win, "MdCal", "메모 파일이 다른 곳에서 변경되었습니다. 다시 시도하세요.")
+            self.index.rescan()
+            return
+        except OSError as e:
+            QMessageBox.warning(self.win, "MdCal", f"할 일 변경 실패\n{e}")
+            return
+        self.index.rescan()
+
+    def _run_carry(self, sources, target, manual: bool):
+        if not self.memos.enabled:
+            if manual:
+                QMessageBox.warning(self.win, "MdCal", "메모 저장 폴더를 사용할 수 없습니다.")
+            return False
+        if self.detail.isVisible():
+            self.detail.flush()
+            if self.detail.has_unsaved:
+                QMessageBox.warning(self.win, "MdCal", "저장되지 않은 메모가 있어 넘기기를 중단했습니다")
+                return False
+        result = carry.carry(self.memos, sources, target)
+        self.index.rescan()
+        self.detail.reload_notes()
+        if result.errors:
+            QMessageBox.warning(self.win, "MdCal",
+                                f"{result.moved}개를 옮긴 뒤 넘기기를 중단했습니다.\n" + "\n".join(result.errors))
+            return False
+        if manual:
+            # marked counts lines already present today too (moved = newly appended only)
+            QMessageBox.information(self.win, "MdCal", f"{result.marked}개를 오늘로 넘겼습니다")
+        elif result.moved:
+            self.tray.showMessage("MdCal", f"미완료 할 일 {result.moved}개를 오늘로 옮겼습니다")
+        return True
+
+    def _auto_carry(self):
+        today = date.today()
+        if (self.cfg.get("carry_mode", "manual") != "auto"
+                or self.cfg.get("last_carry") == today.isoformat() or not self.memos.enabled):
+            return
+        try:
+            days = carry.pending_days(self.memos, today, self.cfg.get("carry_lookback_days", 14))
+        except OSError as e:
+            QMessageBox.warning(self.win, "MdCal", f"미완료 할 일 확인 실패\n{e}")
+            return
+        if days and not self._run_carry(sorted(days), today, manual=False):
+            return
+        previous = self.cfg.get("last_carry")
+        self.cfg["last_carry"] = today.isoformat()
+        try:
+            save_config(self.cfg)
+        except OSError as e:
+            self.cfg["last_carry"] = previous
+            QMessageBox.warning(self.win, "MdCal", f"자동 넘기기 날짜 저장 실패\n{e}")
+
+    def _set_carry_mode(self, mode):
+        previous = self.cfg.get("carry_mode", "manual")
+        self.cfg["carry_mode"] = mode
+        try:
+            save_config(self.cfg)
+        except OSError as e:
+            self.cfg["carry_mode"] = previous
+            QMessageBox.warning(self.win, "MdCal", f"할 일 넘기기 설정 저장 실패\n{e}")
+            return
+        self.win.grid.carry_menu = mode != "off"
+        if mode == "auto":
+            self._auto_carry()
 
     def _migrate_db_memos(self):
         """One-time: move memos from the old DB table into <memo_folder>\\YYMMDD.md."""
@@ -150,6 +238,17 @@ class App:
         mm.addAction("변경…", self._change_memo_folder)
         if mf and os.path.isdir(mf):
             mm.addAction("탐색기에서 열기", lambda: os.startfile(mf))
+
+        cm = m.addMenu("미완료 할 일 넘기기")
+        carry_group = QActionGroup(cm)
+        carry_group.setExclusive(True)
+        for label, mode in (("자동 (시작·자정에 오늘로)", "auto"),
+                            ("수동 (날짜 우클릭)", "manual"), ("끄기", "off")):
+            a = QAction(label, cm, checkable=True,
+                        checked=self.cfg.get("carry_mode", "manual") == mode)
+            a.triggered.connect(lambda _=False, mode=mode: self._set_carry_mode(mode))
+            carry_group.addAction(a)
+            cm.addAction(a)
 
         om = m.addMenu("배경 투명도")
         grp = QActionGroup(om)
