@@ -16,6 +16,7 @@ class MemoDoc:
     body: str
     frontmatter: str      # raw text between --- lines, None if absent
     mtime: float          # None if the file does not exist
+    error: str | None = None
 
 
 class MemoFiles:
@@ -43,9 +44,9 @@ class MemoFiles:
         mtime = self._mtime(p)
         if mtime is None:
             return MemoDoc("", None, None)
-        text, _err = decode_bytes(p.read_bytes())
+        text, error = decode_bytes(p.read_bytes())
         fm, body = split_frontmatter(text)
-        return MemoDoc(body, fm, mtime)
+        return MemoDoc(body, fm, mtime, error)
 
     def write(self, day: date, body: str, expected_mtime):
         """Write body (keeps existing frontmatter). Empty body moves the file to vault .trash.
@@ -54,13 +55,16 @@ class MemoFiles:
         cur = self._mtime(p)
         if cur != expected_mtime:
             raise MemoConflict(str(p))
+        fm = None
+        if cur is not None:
+            text, error = decode_bytes(p.read_bytes())
+            if error:
+                raise OSError(f"메모 인코딩 오류로 저장할 수 없습니다: {p}\n{error}")
+            fm, _ = split_frontmatter(text)
         if not body.strip():
             if cur is not None:
                 self._to_trash(p)
             return None
-        fm = None
-        if cur is not None:
-            fm, _ = split_frontmatter(decode_bytes(p.read_bytes())[0])
         if fm is None:
             fm = f"date: {day.isoformat()}"
         if not body.endswith("\n"):

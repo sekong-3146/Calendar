@@ -1,6 +1,7 @@
 """Scan MD folders, map files to dates by filename, watch for changes. Read-only."""
 import os
 import re
+import stat
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -122,6 +123,7 @@ class MdIndex(QObject):
         self.memo_folder = memo_folder   # always scanned; its YYMMDD.md files are calendar memos
         self.by_day = {}
         self.missing = []            # configured folders that do not exist
+        self.scan_errors = []       # surfaced on startup and explicit refresh only
         self._cache = {}             # path -> MdNote (reuse parsed content if mtime same)
         self._watcher = QFileSystemWatcher(self)
         self._watcher.directoryChanged.connect(self._schedule)
@@ -154,12 +156,27 @@ class MdIndex(QObject):
     def rescan(self):
         by_day, dirs, files, cache = {}, [], [], {}
         roots = self._roots()
-        self.missing = [f for f in roots if not os.path.isdir(f)]
+        self.missing = []
+        self.scan_errors = []
+
+        def scan_error(error):
+            if not isinstance(error, FileNotFoundError):
+                self.scan_errors.append(str(error))
+
         for root in roots:
-            if not os.path.isdir(root):
+            try:
+                is_dir = stat.S_ISDIR(os.stat(root).st_mode)
+            except FileNotFoundError:
+                self.missing.append(root)
+                continue
+            except OSError as e:
+                self.scan_errors.append(f"{root}: {e}")
+                continue
+            if not is_dir:
+                self.missing.append(root)
                 continue
             base = Path(root).name
-            for cur, subdirs, names in os.walk(root):
+            for cur, subdirs, names in os.walk(root, onerror=scan_error):
                 subdirs[:] = [d for d in subdirs if not d.startswith(".")]   # .obsidian, .trash, .git
                 dirs.append(cur)
                 rel = os.path.relpath(cur, root)
@@ -173,8 +190,11 @@ class MdIndex(QObject):
                         continue
                     try:
                         mtime = p.stat().st_mtime
-                    except OSError:
-                        continue         # removed between listdir and stat; next scan settles it
+                    except FileNotFoundError:
+                        continue         # Removed between walk and stat.
+                    except OSError as e:
+                        self.scan_errors.append(f"{p}: {e}")
+                        continue
                     old = self._cache.get(p)
                     note = old if old and old.mtime == mtime else MdNote(p, day, label, folder, mtime)
                     cache[p] = note

@@ -25,7 +25,9 @@ def registered(key=RUN_KEY):
 
 
 def set_enabled(on: bool, key=RUN_KEY):
-    """Raises OSError on registry failure."""
+    """Return False if already off, True on success; raise OSError on failure."""
+    if not on and registered(key) is None:
+        return False
     with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key, 0, winreg.KEY_SET_VALUE) as k:
         if on:
             winreg.SetValueEx(k, VALUE_NAME, 0, winreg.REG_SZ, command())
@@ -33,13 +35,13 @@ def set_enabled(on: bool, key=RUN_KEY):
             try:
                 winreg.DeleteValue(k, VALUE_NAME)
             except FileNotFoundError:
-                pass     # already off
+                return False     # Removed by another process after the check.
+    return True
 
 
 def refresh(key=RUN_KEY):
     """If enabled but pointing at an old path (project moved), rewrite it. Returns True if changed."""
     cur = registered(key)
     if cur is not None and cur != command():
-        set_enabled(True, key)
-        return True
+        return set_enabled(True, key)
     return False

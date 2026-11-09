@@ -110,8 +110,17 @@ class App:
             QMessageBox.warning(None, "MdCal", "DB 메모 이전 실패 (DB에 남겨둠):\n" + "\n".join(failed))
 
     def _warn_missing(self):
+        warnings = []
         if self.index.missing:
-            QMessageBox.warning(None, "MdCal", "다음 MD 폴더를 찾을 수 없습니다:\n" + "\n".join(self.index.missing))
+            warnings.append("다음 MD 폴더를 찾을 수 없습니다:\n" + "\n".join(self.index.missing))
+        if self.index.scan_errors:
+            warnings.append("다음 MD 파일/폴더를 확인할 수 없습니다:\n" + "\n".join(self.index.scan_errors))
+        if warnings:
+            QMessageBox.warning(None, "MdCal", "\n\n".join(warnings))
+
+    def _refresh(self):
+        self.index.rescan()
+        self._warn_missing()
 
     def _on_tray(self, reason):
         if reason == QSystemTrayIcon.DoubleClick:
@@ -123,7 +132,7 @@ class App:
         m.clear()
         m.addAction("보이기" if not self.win.isVisible() else "숨기기", self._toggle_visible)
         m.addAction("오늘로", self.win.go_today)
-        m.addAction("새로고침", self.index.rescan)
+        m.addAction("새로고침", self._refresh)
         m.addSeparator()
 
         fm = m.addMenu("MD 폴더")
@@ -156,8 +165,16 @@ class App:
         a = QAction("위치 잠금", m, checkable=True, checked=self.cfg["locked"])
         a.triggered.connect(self.win.set_locked)
         m.addAction(a)
-        a = QAction("Windows 시작 시 자동 실행", m, checkable=True, checked=autostart.registered() is not None)
-        a.triggered.connect(self._toggle_autostart)
+        try:
+            enabled = autostart.registered() is not None
+        except OSError as e:
+            a = QAction("Windows 시작 시 자동 실행 (확인 실패)", m)
+            a.setEnabled(False)
+            a.setToolTip(str(e))
+        else:
+            a = QAction("Windows 시작 시 자동 실행", m, checkable=True, checked=enabled)
+            a.triggered.connect(self._toggle_autostart)
+        m.setToolTipsVisible(True)
         m.addAction(a)
         m.addSeparator()
         m.addAction("데이터 폴더 열기", lambda: os.startfile(str(APP_DIR)))
@@ -165,7 +182,7 @@ class App:
 
     def _toggle_autostart(self, on):
         try:
-            autostart.set_enabled(on)
+            autostart.set_enabled(on)     # False means already off; no warning needed.
         except OSError as e:
             QMessageBox.warning(None, "MdCal", f"자동 실행 설정 실패\n{e}")
 

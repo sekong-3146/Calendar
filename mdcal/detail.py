@@ -1,9 +1,10 @@
 """Expanded day view: editable memo + read-only MD notes."""
 import os
+from datetime import timedelta
 from pathlib import Path
 from urllib.parse import quote
 
-from PySide6.QtCore import QRect, QRectF, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QRect, QRectF, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (QColor, QDesktopServices, QGuiApplication, QKeySequence, QPainter,
                            QPalette, QPen, QShortcut)
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit, QPushButton,
@@ -72,13 +73,20 @@ class DayDetail(QWidget):
         hl.addWidget(close)
 
         self.memo = QPlainTextEdit()
+        self.memo.installEventFilter(self)
         self.memo.setPlaceholderText("메모를 입력하세요 (자동 저장)")
         self.memo.textChanged.connect(self._on_edit)
         memo_box = QWidget()
         ml = QVBoxLayout(memo_box)
         ml.setContentsMargins(0, 0, 0, 0)
         self.memo_label = QLabel("메모", objectName="section")
-        ml.addWidget(self.memo_label)
+        self.btn_open_memo = QPushButton("메모 Obsidian에서 열기")
+        self.btn_open_memo.setEnabled(self.memos.enabled)
+        self.btn_open_memo.clicked.connect(self._open_memo)
+        memo_head = QHBoxLayout()
+        memo_head.addWidget(self.memo_label, 1)
+        memo_head.addWidget(self.btn_open_memo)
+        ml.addLayout(memo_head)
         ml.addWidget(self.memo)
 
         self.tabs = QTabWidget()
@@ -106,41 +114,73 @@ class DayDetail(QWidget):
         self._save_timer = QTimer(self, singleShot=True, interval=700)
         self._save_timer.timeout.connect(self.flush)
         QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self.close)
+        QShortcut(QKeySequence("Ctrl+Left"), self, activated=lambda: self._shift_day(-1))
+        QShortcut(QKeySequence("Ctrl+Right"), self, activated=lambda: self._shift_day(1))
         self.resize(560, 640)
 
     # data
-    def show_day(self, day, anchor: QRect):
-        self.flush()
-        if self._dirty:          # save failed: stay on the current day
+    def show_day(self, day, anchor: QRect | None = None):
+        if not self._load_memo(day):
             return
         self.day = day
         self.title.setText(f"{day.year}년 {day.month}월 {day.day}일 ({WEEK_KO[day.weekday()]})")
-        self._load_memo()
         self._load_notes()
-        self._place(anchor)
+        if anchor is not None:
+            self._place(anchor)
         self.show()
-        if self.topmost:
-            set_topmost(int(self.winId()), True)
+        set_topmost(int(self.winId()), self.topmost)
         self.raise_()
         self.activateWindow()
         self.memo.setFocus()
         self.memo.moveCursor(self.memo.textCursor().MoveOperation.End)
 
-    def _load_memo(self):
-        self._dirty = False
+    def eventFilter(self, watched, event):
+        if (event.type() == QEvent.ShortcutOverride
+                and event.modifiers() == Qt.ControlModifier
+                and event.key() in (Qt.Key_Left, Qt.Key_Right)):
+            event.ignore()       # Let day shortcuts override the editor's word navigation.
+            return True
+        return super().eventFilter(watched, event)
+
+    def _shift_day(self, delta):
+        if self.day is not None:
+            self.show_day(self.day + timedelta(days=delta))
+
+    def _load_memo(self, day=None):
+        navigating = day is not None
+        day = self.day if day is None else day
+        try:
+            doc = self.memos.read(day) if self.memos.enabled else None
+        except OSError as e:
+            QMessageBox.warning(self, "MdCal", f"메모 읽기 실패 (현재 내용은 유지됨)\n{e}")
+            return False
+        if navigating:
+            was_dirty = self._dirty
+            self.flush()                 # Stage the target read before changing current edits.
+            if self._dirty:
+                return False
+            if day == self.day and was_dirty:
+                return True              # Keep the result of saving or resolving this same day.
         self.memo.blockSignals(True)
-        if self.memos.enabled:
-            doc = self.memos.read(self.day)
-            self._base_mtime = doc.mtime
-            self.memo.setReadOnly(False)
-            self.memo.setPlainText(doc.body)
-            self.memo_label.setText(f"메모 → {self.memos.display_name(self.day)}")
-        else:
-            self._base_mtime = None
-            self.memo.setReadOnly(True)
-            self.memo.setPlainText("")
-            self.memo_label.setText("메모 (저장 폴더 없음 — 트레이 메뉴 > 메모 저장 폴더)")
-        self.memo.blockSignals(False)
+        try:
+            if doc is not None:
+                self._base_mtime = doc.mtime
+                self.memo.setReadOnly(bool(doc.error))
+                self.memo.setPlainText(doc.body)
+                label = f"메모 → {self.memos.display_name(day)}"
+                if doc.error:
+                    label += f" (읽기 전용: {doc.error})"
+                self.memo_label.setText(label)
+            else:
+                self._base_mtime = None
+                self.memo.setReadOnly(True)
+                self.memo.setPlainText("")
+                self.memo_label.setText("메모 (저장 폴더 없음 — 트레이 메뉴 > 메모 저장 폴더)")
+            self.btn_open_memo.setEnabled(doc is not None)
+            self._dirty = False
+        finally:
+            self.memo.blockSignals(False)
+        return True
 
     def reload_notes(self):
         """Called when MD files change while open."""
@@ -151,7 +191,8 @@ class DayDetail(QWidget):
             mtime = p.stat().st_mtime if p.exists() else None
             if mtime != self._base_mtime:          # edited outside (Obsidian)
                 pos = self.memo.textCursor().position()
-                self._load_memo()
+                if not self._load_memo():
+                    return
                 c = self.memo.textCursor()
                 c.setPosition(min(pos, len(self.memo.toPlainText())))
                 self.memo.setTextCursor(c)
@@ -165,9 +206,13 @@ class DayDetail(QWidget):
     def _load_notes(self):
         self.notes = self.index.notes(self.day)
         self._notes_sig = [(n.path, n.mtime) for n in self.notes]
-        self.tabs.clear()
+        while self.tabs.count():
+            page = self.tabs.widget(0)
+            self.tabs.removeTab(0)
+            page.deleteLater()
         for n in self.notes:
             view = QTextBrowser()
+            view.installEventFilter(self)
             view.setOpenExternalLinks(True)
             pal = view.palette()
             pal.setColor(QPalette.Link, QColor("#7BB6FF"))
@@ -183,7 +228,7 @@ class DayDetail(QWidget):
 
     def set_topmost(self, on: bool):
         self.topmost = on
-        if self.isVisible():
+        if self.testAttribute(Qt.WA_WState_Created):
             set_topmost(int(self.winId()), on)
 
     @property
@@ -197,7 +242,7 @@ class DayDetail(QWidget):
     def flush(self):
         """Write memo md. Never overwrites a file changed outside without asking."""
         self._save_timer.stop()
-        if not (self._dirty and self.day is not None and self.memos.enabled):
+        if not (self._dirty and self.day is not None and self.memos.enabled) or self.memo.isReadOnly():
             return
         try:
             self._base_mtime = self.memos.write(self.day, self.memo.toPlainText(), self._base_mtime)
@@ -215,26 +260,57 @@ class DayDetail(QWidget):
                           f"{self.memos.display_name(self.day)} 파일이 다른 곳(Obsidian 등)에서 변경되었습니다.",
                           parent=self)
         keep = box.addButton("내 메모로 덮어쓰기", QMessageBox.AcceptRole)
-        box.addButton("파일 내용 불러오기 (내 변경 버림)", QMessageBox.RejectRole)
-        box.exec()
+        reload = box.addButton("파일 내용 불러오기 (내 변경 버림)", QMessageBox.DestructiveRole)
+        cancel = box.addButton("취소", QMessageBox.RejectRole)
+        box.setEscapeButton(cancel)
+        box.setDefaultButton(cancel)
+        self._save_timer.stop()
+        try:
+            box.exec()
+        finally:
+            self._save_timer.stop()       # Retry only after another edit or explicit flush.
         if box.clickedButton() is keep:
-            p = self.memos.path(self.day)
-            self._base_mtime = p.stat().st_mtime if p.exists() else None
-            self.flush()
-        else:
-            self._load_memo()
+            try:
+                doc = self.memos.read(self.day)
+                mtime = self.memos.write(self.day, self.memo.toPlainText(), doc.mtime)
+            except (OSError, MemoConflict) as e:
+                QMessageBox.warning(self, "MdCal", f"메모 저장 실패 (편집 내용은 창에 남아 있음)\n{e}")
+                return
+            self._base_mtime = mtime
+            self._dirty = False
+            self.saved.emit(self.day)
+        elif box.clickedButton() is reload and self._load_memo():
             self.saved.emit(self.day)
 
     def _open_current(self):
         i = self.tabs.currentIndex()
         if not 0 <= i < len(self.notes):
             return
-        path = self.notes[i].path
-        if find_vault(path):
-            url = QUrl.fromEncoded(("obsidian://open?path=" + quote(str(path), safe="")).encode("ascii"))
-            if QDesktopServices.openUrl(url):
-                return
+        self._open_path(self.notes[i].path)
+
+    def _open_memo(self):
+        if self.day is None or not self.memos.enabled:
+            return
+        self.flush()
+        if self._dirty:
+            return
+        path = self.memos.path(self.day)
         try:
+            path.stat()
+        except FileNotFoundError:
+            QMessageBox.information(self, "MdCal", "저장된 메모 파일이 없습니다. 메모를 입력하면 저장됩니다.")
+            return
+        except OSError as e:
+            QMessageBox.warning(self, "MdCal", f"메모 파일을 확인할 수 없습니다.\n{path}\n{e}")
+            return
+        self._open_path(path)
+
+    def _open_path(self, path):
+        try:
+            if find_vault(path):
+                url = QUrl.fromEncoded(("obsidian://open?path=" + quote(str(path), safe="")).encode("ascii"))
+                if QDesktopServices.openUrl(url):
+                    return
             os.startfile(str(path))       # default .md app when Obsidian URI is unavailable
         except OSError as e:
             QMessageBox.warning(self, "MdCal", f"파일을 열 수 없습니다.\n{path}\n{e}")

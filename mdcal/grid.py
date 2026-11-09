@@ -1,10 +1,11 @@
 """Month calendar window pinned to the desktop bottom."""
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from html import escape
 
-from PySide6.QtCore import QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
-from PySide6.QtWidgets import (QHBoxLayout, QLabel, QMenu, QSizeGrip, QToolButton,
+from PySide6.QtWidgets import (QHBoxLayout, QLabel, QMenu, QSizeGrip, QToolButton, QToolTip,
                                QVBoxLayout, QWidget)
 
 from .config import save_config
@@ -58,12 +59,15 @@ class GridWidget(QWidget):
         self.cells = []
         self.data = {}
         self.hover = None
+        self._truncated = set()
         self.f_head = QFont(FONT, 9)
         self.f_day = QFont(FONT, 10, QFont.Bold)
         self.f_text = QFont(FONT, 8)
 
     def set_view(self, month, cells, data, sunday_first):
         self.month, self.cells, self.data, self.sunday_first = month, cells, data, sunday_first
+        self._truncated.clear()
+        QToolTip.hideText()
         self.update()
 
     # geometry
@@ -107,6 +111,7 @@ class GridWidget(QWidget):
             p.drawLine(int(c * w), HEAD_H, int(c * w), self.height())
 
         today = date.today()
+        self._truncated.clear()
         for idx, d in enumerate(self.cells):
             self._paint_cell(p, idx, d, today)
 
@@ -156,10 +161,25 @@ class GridWidget(QWidget):
             p.drawText(QRectF(x, y, tw, lh), Qt.AlignLeft | Qt.AlignVCenter, el)
             y += lh
         if cut:      # hint: double-click to see everything
+            self._truncated.add(idx)
             p.setPen(_with_alpha(C_TODAY, fade))
             p.drawText(r.adjusted(0, 0, -5, -1), Qt.AlignRight | Qt.AlignBottom, "⋯")
 
     # input
+    def event(self, e):
+        if e.type() == QEvent.ToolTip:
+            idx = self._hit(e.pos())
+            if idx in self._truncated:
+                cd = self.data[self.cells[idx]]
+                parts = ([cd.memo] if cd.memo else []) + ["\n".join(lines) for lines in cd.md]
+                text = '<p style="white-space:pre-wrap">' + escape("\n\n".join(parts)).replace("\n", "<br>") + "</p>"
+                QToolTip.showText(e.globalPos(), text, self, self.cell_rect(idx).toRect())
+            else:
+                QToolTip.hideText()
+                e.ignore()
+            return True
+        return super().event(e)
+
     def mouseMoveEvent(self, e):
         idx = self._hit(e.position())
         if idx != self.hover:
@@ -345,7 +365,7 @@ class CalendarWindow(QWidget):
         return False, 0
 
     def _on_pin_tick(self):
-        if self.pin is not None and self.isVisible():
+        if self.pin is not None and (self.isVisible() or self.pin.raised):
             self.pin.poll()
 
     def _on_tick(self):
