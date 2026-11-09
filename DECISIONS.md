@@ -1,5 +1,26 @@
 # DECISIONS
 
+## 2026-11-09 10:59 달력 헤더에 메뉴(☰) 버튼 추가
+- 증상: 설정 메뉴가 트레이 아이콘 우클릭으로만 열림
+- 원인: -
+- 처리: 헤더 우측(`오늘` 오른쪽)에 `btn_menu`(☰, InstantPopup) 추가. `app.py`에서 트레이와 같은 `QMenu`를 `setMenu`로 연결 → `aboutToShow`로 항목이 매번 다시 만들어짐
+- 주의: 메뉴는 트레이와 공유하는 객체 하나. 버튼용 메뉴를 따로 만들면 항목이 어긋날 수 있음
+
+## 2026-11-09 09:12 Win+D에도 달력 유지 + Windows 시작 시 자동 실행
+- 증상: Win+D(바탕화면 보기)를 누르면 달력이 바탕화면에 가려짐. 자동 실행 옵션 없음
+- 원인:
+  - 기존 `check_covered`는 창 중심점 hit test 방식이었는데, 중심점에 투명한 시스템 창(CoreWindow 등)이 겹치면 바탕화면을 감지하지 못함 (11-09 측정에서 Win+D 전부터 CoreWindow가 잡힘)
+  - Qt `WindowStaysOnBottomHint`가 WM_WINDOWPOSCHANGING에서 z-order를 강제로 바닥에 둬서, TOPMOST 지정이 무시됨 (실험: hint가 있으면 TOPMOST 실패, 없으면 성공)
+- 처리:
+  - `winpin.BottomPin.poll()` (0.3초 간격): 포그라운드가 바탕화면(또는 우리 창)이고 z-order상 위에 보이는 Progman/WorkerW가 있으면 → TOPMOST. 포그라운드가 셸이 아닌 다른 앱이 되면 → NOTOPMOST 후 바닥으로
+  - `CalendarWindow`에서 `WindowStaysOnBottomHint` 제거 (바닥 고정은 nativeEvent가 담당)
+  - 확장 창도 `raisedChanged`에 맞춰 TOPMOST 동기화 (달력 아래로 숨지 않게)
+  - `autostart.py` 신규: HKCU Run `MdCal` = `"<venv>\pythonw.exe" "<repo>\MdCal.pyw"`. 트레이 메뉴 체크로 켜고 끔. 앱 시작 시 등록된 경로가 현재 위치와 다르면 갱신
+- 주의:
+  - `WindowStaysOnBottomHint`를 다시 넣으면 Win+D 대응이 깨짐
+  - 실제 Win+D 동작은 확인 못 함 (작업 시점에 화면이 잠겨 있었음). 상태 전환 로직, TOPMOST 플래그, 바닥 고정만 테스트로 확인
+  - 자동 실행은 venv 경로에 묶임. 프로젝트 폴더나 venv를 옮기면 앱을 한 번 실행해야 Run 값이 갱신됨
+
 ## 2026-11-06 18:29 달력 메모를 md 파일로 저장 + vault 폴더명 표시
 - 증상: 메모가 앱 DB에만 있어 Obsidian에서 볼 수 없음. 여러 vault 노트가 섞여 출처 구분 안 됨
 - 원인: 1차 요구사항(MD 읽기 전용, 메모는 DB)

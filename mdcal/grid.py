@@ -202,8 +202,12 @@ class HeaderBar(QWidget):
 
 
 class CalendarWindow(QWidget):
+    raisedChanged = Signal(bool)     # True while lifted above the Win+D desktop
+
     def __init__(self, cfg, store, index):
-        super().__init__(None, Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnBottomHint)
+        # No WindowStaysOnBottomHint: Qt would block the TOPMOST lift used for Win+D.
+        # Bottom pinning is done by BottomPin via nativeEvent.
+        super().__init__(None, Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowTitle("MdCal")
         self.cfg, self.store, self.index = cfg, store, index
@@ -218,9 +222,14 @@ class CalendarWindow(QWidget):
         hl.setContentsMargins(10, 6, 10, 2)
         btn_css = ("QToolButton{color:#E8EAED;background:transparent;border:none;padding:2px 8px;"
                    "font:10pt 'Malgun Gothic';border-radius:4px}"
-                   "QToolButton:hover{background:rgba(255,255,255,30)}")
+                   "QToolButton:hover{background:rgba(255,255,255,30)}"
+                   "QToolButton::menu-indicator{image:none;width:0}")
         self.btn_prev, self.btn_next, self.btn_today = QToolButton(), QToolButton(), QToolButton()
-        for b, t in ((self.btn_prev, "◀"), (self.btn_next, "▶"), (self.btn_today, "오늘")):
+        self.btn_menu = QToolButton()       # menu attached by app (same as tray menu)
+        self.btn_menu.setPopupMode(QToolButton.InstantPopup)
+        self.btn_menu.setToolTip("메뉴")
+        for b, t in ((self.btn_prev, "◀"), (self.btn_next, "▶"), (self.btn_today, "오늘"),
+                     (self.btn_menu, "☰")):
             b.setText(t)
             b.setStyleSheet(btn_css)
             b.setCursor(Qt.PointingHandCursor)
@@ -231,6 +240,7 @@ class CalendarWindow(QWidget):
         hl.addWidget(self.btn_next)
         hl.addStretch(1)
         hl.addWidget(self.btn_today)
+        hl.addWidget(self.btn_menu)
         self.btn_prev.clicked.connect(lambda: self.shift_month(-1))
         self.btn_next.clicked.connect(lambda: self.shift_month(1))
         self.btn_today.clicked.connect(self.go_today)
@@ -253,6 +263,9 @@ class CalendarWindow(QWidget):
         self._tick = QTimer(self, interval=1000)
         self._tick.timeout.connect(self._on_tick)
         self._tick.start()
+        self._pin_timer = QTimer(self, interval=300)     # Win+D detection
+        self._pin_timer.timeout.connect(self._on_pin_tick)
+        self._pin_timer.start()
         self._apply_geometry()
 
     # month navigation / data
@@ -322,17 +335,20 @@ class CalendarWindow(QWidget):
     def showEvent(self, e):
         super().showEvent(e)
         if self.pin is None:
-            self.pin = BottomPin(int(self.winId()))
-        self.pin.send_to_bottom()
+            self.pin = BottomPin(int(self.winId()), self.raisedChanged.emit)
+        if not self.pin.raised:
+            self.pin.send_to_bottom()
 
     def nativeEvent(self, event_type, message):
         if self.pin is not None:
             self.pin.handle(int(message))
         return False, 0
 
-    def _on_tick(self):
+    def _on_pin_tick(self):
         if self.pin is not None and self.isVisible():
-            self.pin.check_covered()
+            self.pin.poll()
+
+    def _on_tick(self):
         t = date.today()
         if t != self._shown_today:      # midnight: move highlight / month
             if (self.year, self.month) == (self._shown_today.year, self._shown_today.month):

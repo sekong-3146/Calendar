@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit,
                                QVBoxLayout, QWidget)
 
 from .memofile import MemoConflict
+from .winpin import set_topmost
 
 WEEK_KO = "월화수목금토일"
 
@@ -58,6 +59,7 @@ class DayDetail(QWidget):
         self._dirty = False
         self._base_mtime = None                   # memo file mtime when loaded/saved
         self._notes_sig = []
+        self.topmost = False                      # follows the calendar while Win+D desktop is shown
 
         head = _Header(self)
         hl = QHBoxLayout(head)
@@ -117,6 +119,8 @@ class DayDetail(QWidget):
         self._load_notes()
         self._place(anchor)
         self.show()
+        if self.topmost:
+            set_topmost(int(self.winId()), True)
         self.raise_()
         self.activateWindow()
         self.memo.setFocus()
@@ -176,6 +180,11 @@ class DayDetail(QWidget):
         self.notes_box.setVisible(bool(self.notes))
         if self.notes:
             self.split.setSizes([160, 480])
+
+    def set_topmost(self, on: bool):
+        self.topmost = on
+        if self.isVisible():
+            set_topmost(int(self.winId()), on)
 
     @property
     def has_unsaved(self):

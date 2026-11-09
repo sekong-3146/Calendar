@@ -9,6 +9,7 @@ from PySide6.QtCore import QLockFile, QRectF, Qt
 from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QMessageBox, QSystemTrayIcon
 
+from . import autostart
 from .config import APP_DIR, DB_PATH, LOCK_PATH, load_config, save_config
 from .detail import DayDetail
 from .grid import CalendarWindow
@@ -66,6 +67,7 @@ class App:
         self.detail.saved.connect(lambda _d: self.index.rescan())   # pick up the new file mtime now
         self.win.grid.dayActivated.connect(
             lambda d: self.detail.show_day(d, self.win.grid.cell_global_rect(d)))
+        self.win.raisedChanged.connect(self.detail.set_topmost)
 
         icon = make_icon()
         qapp.setWindowIcon(icon)
@@ -75,6 +77,7 @@ class App:
         self.menu = QMenu()
         self.menu.aboutToShow.connect(self._build_menu)
         self.tray.setContextMenu(self.menu)
+        self.win.btn_menu.setMenu(self.menu)     # header ☰ shows the same menu
 
         if warn:
             QMessageBox.warning(None, "MdCal", warn)
@@ -83,6 +86,10 @@ class App:
         self.win.show()
         self.tray.show()
         self._warn_missing()
+        try:
+            autostart.refresh()          # project moved -> fix the Run path
+        except OSError as e:
+            QMessageBox.warning(None, "MdCal", f"자동 실행 경로 갱신 실패\n{e}")
 
     def _migrate_db_memos(self):
         """One-time: move memos from the old DB table into <memo_folder>\\YYMMDD.md."""
@@ -149,9 +156,18 @@ class App:
         a = QAction("위치 잠금", m, checkable=True, checked=self.cfg["locked"])
         a.triggered.connect(self.win.set_locked)
         m.addAction(a)
+        a = QAction("Windows 시작 시 자동 실행", m, checkable=True, checked=autostart.registered() is not None)
+        a.triggered.connect(self._toggle_autostart)
+        m.addAction(a)
         m.addSeparator()
         m.addAction("데이터 폴더 열기", lambda: os.startfile(str(APP_DIR)))
         m.addAction("종료", self.quit)
+
+    def _toggle_autostart(self, on):
+        try:
+            autostart.set_enabled(on)
+        except OSError as e:
+            QMessageBox.warning(None, "MdCal", f"자동 실행 설정 실패\n{e}")
 
     def _toggle_visible(self):
         self.win.setVisible(not self.win.isVisible())
