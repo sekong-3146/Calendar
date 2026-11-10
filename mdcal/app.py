@@ -10,7 +10,7 @@ from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter,
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QMessageBox, QSystemTrayIcon
 
 from . import autostart, carry, tasks
-from .config import APP_DIR, DB_PATH, LOCK_PATH, load_config, save_config
+from .config import APP_DIR, DB_PATH, LOCK_PATH, load_config, save_config, update_config
 from .detail import DayDetail
 from .grid import CalendarWindow
 from .mdsource import MdIndex
@@ -70,6 +70,7 @@ class App:
         self.win.grid.taskToggled.connect(self._on_task_toggled)
         self.win.grid.carryRequested.connect(lambda d: self._run_carry([d], date.today(), manual=True))
         self.win.dateChanged.connect(lambda _d: self._auto_carry())
+        self.win.dateChanged.connect(lambda _d: self._refresh_icon())
         self.win.raisedChanged.connect(self.detail.set_topmost)
         self.win.grid.carry_menu = self.cfg.get("carry_mode", "manual") != "off"
 
@@ -95,6 +96,21 @@ class App:
             autostart.refresh()          # project moved -> fix the Run path
         except OSError as e:
             QMessageBox.warning(None, "MdCal", f"자동 실행 경로 갱신 실패\n{e}")
+
+    def _refresh_icon(self):
+        """The icon shows today's day number: redraw it at midnight."""
+        icon = make_icon()
+        self.qapp.setWindowIcon(icon)
+        self.tray.setIcon(icon)
+
+    def _set_cfg(self, key, value, what) -> bool:
+        """Save one setting. On failure the old value stays and the user is told."""
+        try:
+            update_config(self.cfg, key, value)
+        except OSError as e:
+            QMessageBox.warning(None, "MdCal", f"{what} 저장 실패 (변경 취소됨)\n{e}")
+            return False
+        return True
 
     def _on_task_toggled(self, d, line_no, raw):
         if not self.memos.enabled:
@@ -213,6 +229,7 @@ class App:
     def _on_tray(self, reason):
         if reason == QSystemTrayIcon.DoubleClick:
             self.win.show()
+            self.win.unminimize()
             self.win.go_today()
 
     def _build_menu(self):
@@ -289,18 +306,16 @@ class App:
         self.win.setVisible(not self.win.isVisible())
 
     def _toggle_week_start(self, monday):
-        self.cfg["week_starts_sunday"] = not monday
-        save_config(self.cfg)
-        self.win.refresh()
+        if self._set_cfg("week_starts_sunday", not monday, "주 시작 요일 설정"):
+            self.win.refresh()
 
     def _add_folder(self):
         d = QFileDialog.getExistingDirectory(None, "MD 폴더 선택")
         if not d:
             return
         d = os.path.normpath(d)
-        if d not in self.cfg["md_folders"]:
-            self.cfg["md_folders"].append(d)
-            save_config(self.cfg)
+        folders = self.cfg["md_folders"]
+        if d not in folders and self._set_cfg("md_folders", folders + [d], "MD 폴더 목록"):
             self.index.set_folders(self.cfg["md_folders"])
 
     def _change_memo_folder(self):
@@ -311,17 +326,17 @@ class App:
         if not d:
             return
         d = os.path.normpath(d)
-        self.cfg["memo_folder"] = d
-        save_config(self.cfg)
+        if not self._set_cfg("memo_folder", d, "메모 저장 폴더"):
+            return
         self.memos.folder = Path(d)
         self.detail.close()
         self._migrate_db_memos()
         self.index.set_memo_folder(d)
 
     def _remove_folder(self, f):
-        self.cfg["md_folders"].remove(f)
-        save_config(self.cfg)
-        self.index.set_folders(self.cfg["md_folders"])
+        folders = [x for x in self.cfg["md_folders"] if x != f]
+        if self._set_cfg("md_folders", folders, "MD 폴더 목록"):
+            self.index.set_folders(self.cfg["md_folders"])
 
     def quit(self):
         self.detail.flush()

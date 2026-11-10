@@ -62,6 +62,7 @@ class DayDetail(QWidget):
         self._ime_preedit = False
         self._base_mtime = None                   # memo file mtime when loaded/saved
         self._notes_sig = []
+        self._stat_warned = False                 # reload_notes stat failure already reported
         self.topmost = False                      # follows the calendar while Win+D desktop is shown
 
         head = _Header(self)
@@ -331,7 +332,18 @@ class DayDetail(QWidget):
             return
         if self.memos.enabled and not self._dirty:
             p = self.memos.path(self.day)
-            mtime = p.stat().st_mtime if p.exists() else None
+            try:
+                mtime = p.stat().st_mtime
+            except FileNotFoundError:
+                mtime = None
+                self._stat_warned = False
+            except OSError as e:
+                mtime = self._base_mtime           # cannot tell: keep what is shown
+                if not self._stat_warned:          # called on every index change: report once
+                    self._stat_warned = True
+                    QMessageBox.warning(self, "MdCal", f"메모 파일을 확인할 수 없습니다 (화면 내용은 유지됨)\n{p}\n{e}")
+            else:
+                self._stat_warned = False
             if mtime != self._base_mtime:          # edited outside (Obsidian)
                 pos = self.memo.textCursor().position()
                 if not self._load_memo():

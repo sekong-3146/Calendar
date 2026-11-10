@@ -45,6 +45,21 @@ def load_config():
     return cfg, None
 
 
+def update_config(cfg, key, value):
+    """Set one key and save. On failure the old value is restored and OSError is re-raised."""
+    missing = object()
+    old = cfg.get(key, missing)
+    cfg[key] = value
+    try:
+        save_config(cfg)
+    except OSError:
+        if old is missing:
+            del cfg[key]
+        else:
+            cfg[key] = old
+        raise
+
+
 def save_config(cfg):
     """Atomic write: tmp file then replace."""
     APP_DIR.mkdir(parents=True, exist_ok=True)

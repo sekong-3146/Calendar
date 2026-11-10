@@ -4,13 +4,13 @@ from datetime import date, timedelta
 from html import escape
 
 from PySide6.QtCore import QEvent, QRect, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
-from PySide6.QtWidgets import (QHBoxLayout, QLabel, QMenu, QSizeGrip, QToolButton, QToolTip,
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QPen
+from PySide6.QtWidgets import (QHBoxLayout, QLabel, QMenu, QMessageBox, QSizeGrip, QToolButton, QToolTip,
                                QVBoxLayout, QWidget)
 
 from . import tasks
-from .config import save_config
-from .winpin import BottomPin
+from .config import APP_DIR, update_config
+from .winpin import WM_EXITSIZEMOVE, BottomPin, message_id, restore_no_activate
 
 FONT = "Malgun Gothic"
 C_BG = QColor(22, 24, 30)
@@ -337,6 +337,19 @@ class CalendarWindow(QWidget):
         self._pin_timer = QTimer(self, interval=300)     # Win+D detection
         self._pin_timer.timeout.connect(self._on_pin_tick)
         self._pin_timer.start()
+
+        # Monitor add/remove: recheck placement; never save positions caused by it.
+        self._fallback = None            # QRect we moved to because the saved spot is off-screen
+        self._screen_timer = QTimer(self, singleShot=True, interval=500)
+        self._screen_timer.timeout.connect(self._ensure_on_screen)
+        self._hold_save = QTimer(self, singleShot=True, interval=1500)
+        self._geo_save_warned = False
+        app = QGuiApplication.instance()
+        app.screenAdded.connect(self._on_screens_changed)
+        app.screenRemoved.connect(self._on_screens_changed)
+        app.primaryScreenChanged.connect(self._on_screens_changed)
+        for s in QGuiApplication.screens():
+            self._watch_screen(s)
         self._apply_geometry()
 
     # month navigation / data
@@ -369,29 +382,99 @@ class CalendarWindow(QWidget):
         self.refresh()
 
     def set_locked(self, locked):
-        self.cfg["locked"] = locked
+        try:
+            update_config(self.cfg, "locked", locked)
+        except OSError as e:
+            QMessageBox.warning(self, "MdCal", f"위치 잠금 설정 저장 실패\n{e}")
+            return
         self.grip.setVisible(not locked)
-        save_config(self.cfg)
 
     def set_opacity(self, value):
-        self.cfg["opacity"] = value
-        save_config(self.cfg)
+        try:
+            update_config(self.cfg, "opacity", value)
+        except OSError as e:
+            QMessageBox.warning(self, "MdCal", f"투명도 설정 저장 실패\n{e}")
+            return
         self.update()
 
     # window placement
-    def _apply_geometry(self):
+    def _saved_rect(self):
         g = self.cfg.get("geometry")
-        screen = self.screen().availableGeometry()
-        if g and len(g) == 4 and screen.united(self.screen().virtualGeometry()).intersects(QRect(*g)):
-            self.setGeometry(*g)
-        else:
-            w, h = 760, 560
-            self.setGeometry(screen.right() - w - 24, screen.top() + 24, w, h)
+        return QRect(*g) if g and len(g) == 4 else None
 
-    def _store_geometry(self):
+    @staticmethod
+    def _visible(r: QRect) -> bool:
+        """Header strip (drag handle) is reachable on some monitor."""
+        head = QRect(r.x(), r.y(), r.width(), 40)
+        need_w = min(120, head.width())
+        for s in QGuiApplication.screens():
+            part = s.availableGeometry().intersected(head)
+            if part.width() >= need_w and part.height() >= 20:
+                return True
+        return False
+
+    def _default_rect(self):
+        avail = QGuiApplication.primaryScreen().availableGeometry()
+        saved = self._saved_rect()
+        w = min(saved.width() if saved else 760, avail.width() - 48)
+        h = min(saved.height() if saved else 560, avail.height() - 48)
+        return QRect(avail.right() - w - 24, avail.top() + 24, w, h)
+
+    def _apply_geometry(self):
+        saved = self._saved_rect()
+        if saved and self._visible(saved):
+            self._fallback = None
+            self.setGeometry(saved)
+        elif saved:                      # its monitor is missing: park on primary, keep saved
+            self._fallback = self._default_rect()
+            self.setGeometry(self._fallback)
+        else:
+            self._fallback = None
+            self.setGeometry(self._default_rect())
+
+    def _watch_screen(self, s):
+        # UniqueConnection: safe to call again for a screen that is already watched.
+        s.geometryChanged.connect(self._on_screens_changed, Qt.UniqueConnection)
+        s.availableGeometryChanged.connect(self._on_screens_changed, Qt.UniqueConnection)
+
+    def _on_screens_changed(self, *args):
+        for s in QGuiApplication.screens():
+            self._watch_screen(s)
+        self._save_geo.stop()            # Windows may move us; don't overwrite the saved spot
+        self._hold_save.start()
+        self._screen_timer.start()
+
+    def _ensure_on_screen(self):
+        saved = self._saved_rect()
+        if saved and self._visible(saved):
+            if self.geometry() != saved or self._fallback is not None:
+                self._apply_geometry()   # monitor is back: return to the saved spot
+        elif self._fallback is None or not self._visible(self.geometry()):
+            self._apply_geometry()
+
+    def _store_geometry(self, by_user=False):
+        """by_user: the user just finished a drag/resize, so save even during the hold."""
+        if self.isMinimized():
+            return                       # minimized geometry is not a real position
+        if self._hold_save.isActive() and not by_user:
+            self._save_geo.start()       # retry after the hold instead of dropping the change
+            return
+        if self._fallback is not None:
+            if self.geometry() == self._fallback:
+                return                   # parked by us, not moved by the user
+            self._fallback = None        # user moved it: this becomes the new saved spot
         g = self.geometry()
-        self.cfg["geometry"] = [g.x(), g.y(), g.width(), g.height()]
-        save_config(self.cfg)
+        new = [g.x(), g.y(), g.width(), g.height()]
+        if new == self.cfg.get("geometry"):
+            return
+        try:
+            update_config(self.cfg, "geometry", new)
+        except OSError as e:
+            if not self._geo_save_warned:        # timer-driven: report once, not on every move
+                self._geo_save_warned = True
+                QMessageBox.warning(self, "MdCal", f"창 위치 저장 실패 (이후 실패는 다시 알리지 않음)\n{e}")
+            return
+        self._geo_save_warned = False
 
     def moveEvent(self, e):
         self._save_geo.start()
@@ -406,14 +489,34 @@ class CalendarWindow(QWidget):
     def showEvent(self, e):
         super().showEvent(e)
         if self.pin is None:
-            self.pin = BottomPin(int(self.winId()), self.raisedChanged.emit)
+            self.pin = BottomPin(int(self.winId()), self.raisedChanged.emit,
+                                 log_path=str(APP_DIR / "pin.log"),
+                                 on_log_error=lambda e: QMessageBox.warning(
+                                     self, "MdCal", f"pin.log 기록 실패 (기록 중지)\n{e}"))
         if not self.pin.raised:
             self.pin.send_to_bottom()
 
     def nativeEvent(self, event_type, message):
         if self.pin is not None:
             self.pin.handle(int(message))
+        if message_id(int(message)) == WM_EXITSIZEMOVE:
+            # Save now: a monitor-change signal right after must not snap back to the old spot.
+            self._save_geo.stop()
+            self._store_geometry(by_user=True)
         return False, 0
+
+    def changeEvent(self, e):
+        # No taskbar button, so a minimized calendar (Win+M, "minimize all") could not be brought back.
+        if e.type() == QEvent.WindowStateChange and self.isMinimized():
+            QTimer.singleShot(0, self.unminimize)
+        super().changeEvent(e)
+
+    def unminimize(self):
+        if not self.isMinimized():
+            return
+        restore_no_activate(int(self.winId()))
+        if self.pin is not None and not self.pin.raised:
+            self.pin.send_to_bottom()
 
     def _on_pin_tick(self):
         if self.pin is not None and (self.isVisible() or self.pin.raised):
