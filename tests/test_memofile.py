@@ -2,6 +2,7 @@ import tests  # noqa: F401  (sandbox first: must precede every mdcal import)
 import os
 import tempfile
 import unittest
+from unittest import mock
 from datetime import date
 from pathlib import Path
 
@@ -53,6 +54,28 @@ class MemoFilesTest(unittest.TestCase):
         with self.assertRaises(OSError):
             self.memos.write(D10, "new", doc.mtime)
         self.assertEqual(p.read_bytes(), raw)
+
+    def test_failed_save_leaves_no_tmp_file_and_keeps_the_old_text(self):
+        mtime = self.memos.write(D10, "old", None)
+        with mock.patch("mdcal.memofile.os.replace", side_effect=PermissionError(5, "locked")) as rep:
+            with self.assertRaises(PermissionError):
+                self.memos.write(D10, "new", mtime)
+        self.assertEqual(rep.call_count, 3)                              # bounded retry, then give up
+        self.assertEqual([f.name for f in self.dir.iterdir()], ["261110.md"])
+        self.assertEqual(self.memos.read(D10).body, "old\n")
+
+    def test_save_survives_a_momentary_lock(self):
+        mtime = self.memos.write(D10, "old", None)
+        real, calls = os.replace, []
+
+        def flaky(src, dst):
+            calls.append(1)
+            if len(calls) == 1:
+                raise PermissionError(5, "locked")
+            real(src, dst)
+        with mock.patch("mdcal.memofile.os.replace", flaky):
+            self.memos.write(D10, "new", mtime)
+        self.assertEqual((self.memos.read(D10).body, len(calls)), ("new\n", 2))
 
     def test_cp949_file_is_read(self):
         (self.dir / "261110.md").write_bytes("한글 메모\n".encode("cp949"))

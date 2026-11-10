@@ -80,8 +80,9 @@ class CarryTextTest(unittest.TestCase):
         out, block = [], doc.begin()
         while block.isValid():
             fmt = block.blockFormat()
-            if fmt.marker() == QTextBlockFormat.MarkerType.Unchecked:
-                self.assertFalse(fmt.hasProperty(QTextFormat.BlockCodeFence), block.text())
+            # Qt quirk: a code block right after a task item inherits its marker, so code is skipped.
+            if (fmt.marker() == QTextBlockFormat.MarkerType.Unchecked
+                    and not fmt.hasProperty(QTextFormat.BlockCodeFence)):
                 out.append(block.text())
             block = block.next()
         return out
@@ -97,7 +98,11 @@ class CarryTextTest(unittest.TestCase):
                   "~~~\ncode\n    ~~~",
                   "    ```\n\n- [ ] existing",         # 4-space "opener" is indented code, not a fence
                   "- item\n    ```\n    code",         # real fence inside a list item, left open
-                  "- item\n    ```\n    code\n    ```"]
+                  "- item\n    ```\n    code\n    ```",
+                  "- ```\n  code\n  ```\n- [ ] after",   # fence starts on the bullet line
+                  "- [ ] a\n- [ ] b\n  ```\n- [ ] c",     # open fence ends with its list item
+                  "1. step\n   ```\n   code\n- [ ] c",
+                  "- [ ] a\n```\n- [ ] code"]             # top-level fence after a list, left open
         for body in bodies:
             out = tasks.append_task(body, "real task")
             self.assertIn("real task", self.rendered_checkboxes(out), repr(out))
@@ -108,6 +113,19 @@ class CarryTextTest(unittest.TestCase):
         out = tasks.append_open_tasks("    ```\n\n- [ ] existing", ["carried"])
         self.assertEqual(out, "    ```\n\n- [ ] existing\n- [ ] carried\n")
         self.assertEqual(self.rendered_checkboxes(out), ["existing", "carried"])
+
+    def test_fence_inside_a_list_item_ends_with_the_item(self):
+        body = "- ```\n  code\n  ```\n- [ ] real"
+        self.assertEqual([t.text for t in tasks.open_tasks(body)], ["real"])
+        self.assertEqual(tasks.append_task(body, "n"), body + "\n- [ ] n\n")          # no stray fence
+        body = "- [ ] a\n- [ ] b\n  ```\n  - [ ] code\n- [ ] c"
+        self.assertEqual([t.text for t in tasks.open_tasks(body)], ["a", "b", "c"])
+        self.assertEqual(tasks.append_open_tasks(body, ["n"]), body + "\n- [ ] n\n")
+        self.assertEqual(tasks.append_task("- a\n  ```\n  code", "n"), "- a\n  ```\n  code\n- [ ] n\n")
+
+    def test_closing_fence_indent_counts_from_its_container(self):
+        self.assertEqual(tasks.open_tasks("  ```\n    ```\n- [ ] still code"), [])   # 4 spaces: not a closer
+        self.assertEqual([t.text for t in tasks.open_tasks("  ```\n   ```\n- [ ] out")], ["out"])
 
     def test_fence_closes_only_with_same_char_and_length(self):
         body = "~~~\n```\n- [ ] inside\n```\n~~~\n- [ ] out\n````\n```\n- [ ] in2\n````\n- [ ] out2"

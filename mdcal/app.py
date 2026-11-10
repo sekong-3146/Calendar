@@ -18,20 +18,39 @@ from .memofile import MemoConflict, MemoFiles
 from .store import Store
 
 LOG_PATH = APP_DIR / "error.log"
+ERROR_LOG_REPEATS = 5            # how many times the same unhandled error is written to error.log
+_error_box_open = False
+_error_counts = {}               # (type, message, last frame) -> times seen in this run
 
 
 def _excepthook(etype, value, tb):
     """pythonw has no console: log and show every unhandled error."""
     text = "".join(traceback.format_exception(etype, value, tb))
-    try:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"--- {datetime.now():%Y-%m-%d %H:%M:%S}\n{text}\n")
-    except OSError as e:
-        text += f"\n(로그 기록 실패: {e})"
-    if QApplication.instance():
-        QMessageBox.critical(None, "MdCal 오류", text[-3000:])
-    else:
+    # An error in a timer or repaint repeats several times a second: show each distinct error
+    # once per run and log only its first few repeats, or boxes and the log grow without end.
+    frames = traceback.extract_tb(tb)
+    where = (frames[-1].filename, frames[-1].lineno) if frames else None
+    key = (etype.__name__, str(value)[:200], where)
+    count = _error_counts[key] = _error_counts.get(key, 0) + 1
+    if count <= ERROR_LOG_REPEATS:
+        if count == ERROR_LOG_REPEATS:
+            text += "(같은 오류는 이후 기록하지 않음)\n"
+        try:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"--- {datetime.now():%Y-%m-%d %H:%M:%S}\n{text}\n")
+        except OSError as e:
+            text += f"\n(로그 기록 실패: {e})"
+    global _error_box_open
+    if not QApplication.instance():
         sys.__excepthook__(etype, value, tb)
+    elif count == 1 and not _error_box_open:
+        # Timers keep running while the box is open, so never open a second one on top of it.
+        _error_box_open = True
+        try:
+            QMessageBox.critical(None, "MdCal 오류",
+                                 text[-3000:] + f"\n\n(같은 오류는 다시 표시하지 않음. 기록: {LOG_PATH})")
+        finally:
+            _error_box_open = False
 
 
 def make_icon():

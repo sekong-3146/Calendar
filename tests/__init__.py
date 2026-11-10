@@ -38,6 +38,20 @@ def pump(seconds=0.4):
         time.sleep(0.01)
 
 
+def wait_until(condition, timeout=5.0):
+    """Process Qt events until condition() is true. Returns its last value (False on timeout),
+    so tests wait only as long as needed instead of sleeping a fixed time."""
+    import time
+    end = time.monotonic() + timeout
+    while True:
+        qapp().processEvents()
+        if condition():
+            return True
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.01)
+
+
 def assert_sandboxed():
     """Call before a test writes config: fails if mdcal would write outside the sandbox."""
     from mdcal import config

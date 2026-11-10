@@ -61,6 +61,30 @@ class ConfigTest(Base):
             config.update_config(cfg, "brand_new", 1)
         self.assertNotIn("brand_new", cfg)
 
+    def test_wrong_types_in_the_file_fall_back_to_defaults_with_a_warning(self):
+        import json
+        self.addCleanup(lambda: config.CONFIG_PATH.unlink(missing_ok=True))
+        config.CONFIG_PATH.write_text(json.dumps({
+            "opacity": "abc", "geometry": ["a", 1, 2, 3], "md_folders": None, "locked": 1,
+            "carry_mode": "sometimes", "carry_lookback_days": True, "peek_hotkey": 5,
+            "week_starts_sunday": False, "last_carry": "2026-11-10", "unknown": 1}), "utf-8")
+        cfg, warn = config.load_config()
+        defaults = config._defaults()
+        for key in ("opacity", "geometry", "md_folders", "locked", "carry_mode",
+                    "carry_lookback_days", "peek_hotkey"):
+            self.assertEqual(cfg[key], defaults[key], key)
+            self.assertIn(key, warn)
+        self.assertEqual((cfg["week_starts_sunday"], cfg["last_carry"]), (False, "2026-11-10"))
+        self.assertNotIn("week_starts_sunday", warn)
+        self.assertNotIn("unknown", cfg)
+
+    def test_a_saved_config_loads_back_without_warning(self):
+        self.addCleanup(lambda: config.CONFIG_PATH.unlink(missing_ok=True))
+        cfg = config._defaults()
+        cfg.update(geometry=[10, 20, 760, 560], opacity=1, memo_folder="C:\\x", md_folders=["C:\\y"])
+        config.save_config(cfg)
+        self.assertEqual(config.load_config(), (cfg, None))
+
 
 class WindowTest(Base):
     def setUp(self):
@@ -246,6 +270,14 @@ class DetailTest(Base):
         reads = self.memos.reads
         self.detail.reload_notes()
         self.assertEqual((self.memos.reads, self.warnings), (reads + 1, []))
+
+    def test_cell_checkbox_does_not_edit_inside_a_code_block(self):
+        self.detail.memo.setPlainText("```\n- [ ] code\n```\n- [ ] real")
+        self.assertFalse(self.detail.toggle_task_at(1, "- [ ] code"))
+        self.assertEqual(len(self.warnings), 1)
+        self.assertTrue(self.detail.toggle_task_at(3, "- [ ] real"))
+        self.assertEqual(self.detail.memo.toPlainText(), "```\n- [ ] code\n```\n- [x] real")
+        self.assertFalse(self.detail.toggle_task_at(9, "- [ ] nowhere"))          # past the end
 
     def test_append_task_is_one_undo_step(self):
         self.assertTrue(self.detail.append_task("우유 사기"))

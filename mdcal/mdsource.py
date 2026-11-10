@@ -16,6 +16,7 @@ _PATTERNS = [
 ]
 _H_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
+REVIVE_MS = 5000                 # how often a missing configured folder is checked for its return
 
 
 def date_from_name(stem: str):
@@ -144,6 +145,9 @@ class MdIndex(QObject):
         self._watcher.fileChanged.connect(lambda p: self._schedule(os.path.dirname(os.path.normpath(p))))
         self._debounce = QTimer(self, singleShot=True, interval=500)
         self._debounce.timeout.connect(self._flush_pending)
+        # A missing root has nothing to watch, so it is polled; runs only while self.missing is not empty.
+        self._revive = QTimer(self, interval=REVIVE_MS)
+        self._revive.timeout.connect(self._check_missing)
 
     def set_folders(self, folders):
         self.folders = list(folders)
@@ -201,7 +205,26 @@ class MdIndex(QObject):
                 self._walk(root, root)
         finally:
             self._previous, self._quiet = {}, False
+        self._sync_revive()
         self._rebuild(rewatch=set(self._dirs))
+
+    def _sync_revive(self):
+        if self.missing and not self._revive.isActive():
+            self._revive.start()
+        elif not self.missing:
+            self._revive.stop()
+
+    def _check_missing(self):
+        """A configured folder that was missing (never there, deleted, drive unplugged) is back."""
+        touched = set()
+        for root in [r for r in self.missing if os.path.isdir(r)]:
+            touched |= self._rewalk(root, root)
+            if norm(root) in self._dirs:             # still unreadable: stays missing, tried again
+                self.missing.remove(root)
+        self._sync_revive()
+        self.scan_errors = list(dict.fromkeys(self.scan_errors))[-50:]   # polled: must not grow
+        if touched:
+            self._rebuild(rewatch=touched)
 
     def rescan_dirs(self, paths):
         """Rescan only these folders (not their unchanged subfolders). Unknown paths are ignored."""
@@ -217,6 +240,7 @@ class MdIndex(QObject):
                 subdirs = self._scan_dir(root, os.path.normpath(str(path)))
             except FileNotFoundError:
                 self._drop(key)                      # folder is gone
+                self._roots_lost(key)
                 continue
             except OSError as e:
                 self._scan_failed(path, e)           # unreadable right now: keep contents and watches
@@ -248,6 +272,16 @@ class MdIndex(QObject):
         for k in [k for k in self._dirs if self._under(k, key)]:
             del self._dirs[k]
         self._unreadable = {k for k in self._unreadable if not self._under(k, key)}
+
+    def _roots_lost(self, key):
+        """A deleted folder was (or contained) a configured root: nothing is left to watch for
+        its return, so remember it as missing (polled by _check_missing) and tell the user once."""
+        lost = [r for r in self._roots()
+                if self._under(norm(r), key) and r not in self.missing and not os.path.isdir(r)]
+        if lost:
+            self.missing.extend(lost)
+            self._sync_revive()
+            self.scanError.emit("MD 폴더가 사라졌습니다 (다시 생기면 자동으로 읽음)\n" + "\n".join(lost))
 
     def _rewalk(self, root, start):
         """Replace the subtree at start with a fresh walk. Parts that cannot be read keep their
@@ -317,6 +351,9 @@ class MdIndex(QObject):
                 continue                             # Removed between listing and stat.
             except OSError as e:
                 self.scan_errors.append(f"{entry.path}: {e}")
+                kept = self._cache.get(Path(entry.path))
+                if kept is not None:                 # locked for a moment: keep showing the note
+                    notes.append(kept)
                 continue
             old = self._cache.get(p)
             notes.append(old if old and old.mtime == mtime else MdNote(p, day, label, folder, mtime))

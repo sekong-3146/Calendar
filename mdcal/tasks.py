@@ -60,30 +60,63 @@ def editable_mask(lines) -> list:
 
 
 def _scan_fences(lines):
-    """(per-line True if fence delimiter or inside a fence, the fence still open at the end or None).
-    A fence closes only with the same character, at least as long, nothing after it,
-    and at most 3 spaces deeper than its opener."""
-    flags, open_fence, open_indent, list_indent = [], None, 0, None
+    """(per-line True if fence delimiter or inside a fence,
+        the top-level fence still open at the end or None).
+    Follows CommonMark for fences and list items: indentation counts from the list item
+    the line sits in (4+ there is indented code, not a fence); a fence closes with the same
+    character, at least as long, nothing after it; a fence inside a list item also ends
+    when that item ends, so it never needs a closing line from us.
+    Checked against Qt's parser (md4c) on random documents; Obsidian itself was not checked."""
+    flags, items = [], []            # items: content columns of the open list items, outermost first
+    fence, base = None, 0            # open delimiter; content column of the item holding it (0: none)
+    text_before = False              # previous line was paragraph text (a plain line may continue it)
     for ln in lines:
-        s = ln.rstrip("\r")
+        s = ln.rstrip("\r").expandtabs(4)
+        blank = not s.strip()
+        indent = len(s) - len(s.lstrip(" "))
         m = _FENCE_RE.match(s)
-        indent = len(s.expandtabs(4)) - len(s.expandtabs(4).lstrip(" "))
-        if open_fence is None:
-            # 4+ spaces is indented code, not a fence, unless it sits inside a list item.
-            in_reach = indent <= 3 or (list_indent is not None and indent > list_indent)
-            if m and in_reach and not (m["fence"][0] == "`" and "`" in m["rest"]):
-                open_fence, open_indent = m["fence"], indent
-            elif _LIST_RE.match(s):
-                list_indent = indent
-            elif s.strip() and indent == 0:
-                list_indent = None                   # a top-level paragraph ends the list
-            flags.append(open_fence is not None)
-        else:
-            flags.append(True)
-            if (m and m["fence"][0] == open_fence[0] and len(m["fence"]) >= len(open_fence)
-                    and not m["rest"].strip() and indent <= open_indent + 3):
-                open_fence = None
-    return flags, open_fence
+        if fence is not None:
+            closes = (m and m["fence"][0] == fence[0] and len(m["fence"]) >= len(fence)
+                      and not m["rest"].strip())
+            left_item = bool(base) and not blank and indent < base
+            if left_item:                            # the list item ended, and its code block with it
+                while items and indent < items[-1]:
+                    items.pop()
+                fence, text_before = None, False
+                if closes and indent <= 3:           # ...and a closing line there is still its closer
+                    flags.append(True)
+                    continue
+            else:
+                flags.append(True)
+                if closes and indent - base <= 3:
+                    fence = None
+                text_before = False
+                continue
+        if blank:
+            flags.append(False)
+            text_before = False
+            continue
+        lazy = (text_before and items and indent < items[-1] and not m
+                and not _LIST_RE.match(s) and not _HEAD_RE.match(s))
+        if not lazy:                                 # a lazy line continues the item's paragraph
+            while items and indent < items[-1]:
+                items.pop()
+        base = items[-1] if items else 0
+        m = None
+        if indent - base <= 3:
+            item = _LIST_RE.match(s)
+            if item:                                 # '- ```' : the fence may start on the bullet line
+                gap = len(s) - indent - len(item["bullet"]) - len(item["text"])
+                base = indent + len(item["bullet"]) + (gap if gap <= 4 else 1)
+                items.append(base)
+                m = _FENCE_RE.match(item["text"])
+            else:
+                m = _FENCE_RE.match(s)
+        if m and not (m["fence"][0] == "`" and "`" in m["rest"]):
+            fence = m["fence"]
+        flags.append(fence is not None)
+        text_before = fence is None
+    return flags, (fence if base == 0 else None)
 
 
 def tasks(body: str) -> list:

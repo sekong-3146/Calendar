@@ -270,7 +270,9 @@ class DayDetail(QWidget):
         QGuiApplication.inputMethod().commit()
         block = self.memo.document().findBlockByNumber(line_no)
         text = block.text()
-        task = tasks.parse_task(text)
+        # Same rule as the closed-window path (tasks.toggle_done): never edit inside a code block.
+        mask = tasks.editable_mask(self.memo.toPlainText().split("\n"))
+        task = tasks.parse_task(text) if block.isValid() and mask[line_no] else None
         if (not block.isValid() or text.rstrip("\r") != expected_line.rstrip("\r")
                 or task is None or not (task.is_open or task.is_done)):
             QMessageBox.warning(self, "MdCal", "메모 내용이 바뀌었습니다. 다시 시도하세요.")

@@ -43,8 +43,44 @@ def load_config():
         bad = CONFIG_PATH.with_suffix(".json.bad")
         os.replace(CONFIG_PATH, bad)
         return cfg, f"설정 파일을 읽지 못해 기본값으로 시작합니다.\n{e}\n백업: {bad}"
-    cfg.update({k: v for k, v in data.items() if k in cfg})
+    bad = []
+    for k, v in data.items():
+        if k not in cfg:
+            continue
+        if _valid(k, v):
+            cfg[k] = v
+        else:
+            bad.append(f"{k}: {json.dumps(v, ensure_ascii=False)[:60]}")
+    if bad:
+        return cfg, ("설정 파일의 다음 값이 올바르지 않아 기본값을 사용합니다 "
+                     "(다음 설정 저장 때 파일에서도 기본값으로 바뀜).\n" + "\n".join(bad))
     return cfg, None
+
+
+def _number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _valid(key, v) -> bool:
+    """A hand-edited config.json must not reach paint or timer code with a wrong type."""
+    if key == "md_folders":
+        return isinstance(v, list) and all(isinstance(x, str) for x in v)
+    if key in ("memo_folder", "last_carry"):
+        return v is None or isinstance(v, str)
+    if key == "geometry":
+        return v is None or (isinstance(v, list) and len(v) == 4
+                             and all(isinstance(x, int) and not isinstance(x, bool) for x in v))
+    if key == "opacity":
+        return _number(v) and 0 <= v <= 1
+    if key in ("week_starts_sunday", "locked", "pin_debug"):
+        return isinstance(v, bool)
+    if key == "carry_mode":
+        return v in ("auto", "manual", "off")
+    if key == "carry_lookback_days":
+        return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+    if key == "peek_hotkey":
+        return isinstance(v, str)
+    return True
 
 
 def update_config(cfg, key, value):

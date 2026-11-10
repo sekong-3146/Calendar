@@ -1,10 +1,24 @@
 """Calendar memo = one md file per day (<memo_folder>\\YYMMDD.md). The md file is the source of truth."""
 import os
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
 from .mdsource import decode_bytes, split_frontmatter
+
+
+def replace_retry(src, dst, tries=3, wait=0.05):
+    """os.replace, retried briefly when the target is locked for a moment
+    (virus scanner, indexer, sync tool). The last failure is raised."""
+    for left in range(tries - 1, -1, -1):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if not left:
+                raise
+            time.sleep(wait)
 
 
 class MemoConflict(Exception):
@@ -70,9 +84,16 @@ class MemoFiles:
         if not body.endswith("\n"):
             body += "\n"
         tmp = p.with_name(p.name + ".tmp")
-        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-            f.write(f"---\n{fm}\n---\n{body}")
-        os.replace(tmp, p)
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                f.write(f"---\n{fm}\n---\n{body}")
+            replace_retry(tmp, p)
+        except OSError as e:
+            try:
+                tmp.unlink(missing_ok=True)          # never leave a half-saved copy in the vault
+            except OSError as cleanup:           # say so in the message callers show to the user
+                raise OSError(f"{e}\n임시 파일도 지우지 못했습니다: {tmp} ({cleanup})") from e
+            raise
         return self._mtime(p)
 
     def _to_trash(self, p: Path):

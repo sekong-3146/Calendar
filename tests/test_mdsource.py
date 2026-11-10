@@ -9,7 +9,8 @@ from pathlib import Path
 from unittest import mock
 
 from mdcal.mdsource import MdIndex, date_from_name, norm
-from tests import pump, qapp
+from mdcal.memofile import replace_retry
+from tests import qapp, wait_until
 
 D10, D11 = date(2026, 11, 10), date(2026, 11, 11)
 
@@ -68,8 +69,8 @@ class IndexTest(unittest.TestCase):
         (self.root / "261111.md").unlink()
         self.index.rescan_dirs([str(self.root)])
         self.assertIsNone(self.index.memo_note(D11))
-        pump()                                       # the watcher drops deleted paths by itself, later
-        self.assertNotIn(norm(self.root / "261111.md"), self.index.watched())
+        # the watcher drops deleted paths by itself, later
+        self.assertTrue(wait_until(lambda: norm(self.root / "261111.md") not in self.index.watched()))
 
     def test_partial_scan_follows_new_and_removed_subfolders(self):
         (self.root / "new" / "deep").mkdir(parents=True)
@@ -80,8 +81,9 @@ class IndexTest(unittest.TestCase):
         shutil.rmtree(self.root / "sub")
         self.index.rescan_dirs([str(self.root)])
         self.assertEqual((self.titles(D11), self.titles(D10)), ([], []))
-        pump()
-        self.assertEqual(self.index.watched(), {norm(self.root), norm(self.root / "261110.md")})
+        want = {norm(self.root), norm(self.root / "261110.md")}
+        wait_until(lambda: self.index.watched() == want)
+        self.assertEqual(self.index.watched(), want)
 
     def test_partial_scan_matches_full_scan(self):
         (self.root / "sub" / "261111 b.md").write_text("x", "utf-8")
@@ -102,12 +104,14 @@ class IndexTest(unittest.TestCase):
         shutil.rmtree(sub)
         sub.mkdir()                                  # recreated before the watcher's event is handled
         (sub / "261111 new.md").write_text("x", "utf-8")
-        pump(1.2)                                    # real flow: change signal -> debounce -> rescan
+        # real flow: change signal -> debounce -> rescan (-> one retry for the watch)
+        wait_until(lambda: self.titles(D11) == ["vault/sub/new"]
+                   and {norm(sub), norm(sub / "261111 new.md")} <= self.index.watched())
         self.assertEqual((self.titles(D10), self.titles(D11)), ([], ["vault/sub/new"]))
         self.assertIn(norm(sub), self.index.watched())
         self.assertIn(norm(sub / "261111 new.md"), self.index.watched())
         (sub / "261111 second.md").write_text("x", "utf-8")              # the new watch really works
-        pump(1.2)
+        wait_until(lambda: len(self.titles(D11)) == 2)
         self.assertEqual(self.titles(D11), ["vault/sub/new", "vault/sub/second"])
         self.assertEqual(self.index.scan_errors, [])
 
@@ -117,9 +121,10 @@ class IndexTest(unittest.TestCase):
         for body in ("v1", "v2", "v3"):              # tmp -> rename, as memofile and Obsidian save
             tmp = p.with_name(p.name + ".tmp")
             tmp.write_text(body, "utf-8")
-            os.replace(tmp, p)
-            pump(1.0)
+            replace_retry(tmp, p, tries=20)          # a scanner may hold the file for a moment
+            wait_until(lambda: self.index.memo_note(D10).body == body)
             self.assertEqual(self.index.memo_note(D10).body, body)
+        wait_until(lambda: self.titles(D11) == ["vault/sub/auto"])
         self.assertEqual(self.titles(D11), ["vault/sub/auto"])
 
     def failing_scandir(self, bad):
@@ -179,12 +184,12 @@ class IndexTest(unittest.TestCase):
         with mock.patch.object(self.index._watcher, "addPaths", reject_new):
             self.index.rescan_dirs([str(self.root / "sub")])
             self.assertEqual(errors, [])                                 # first failure: retry pending
-            pump(1.6)                                                    # debounce -> retry -> give up
+            wait_until(lambda: errors)                                   # debounce -> retry -> give up
             self.assertEqual(len(errors), 1)
             self.assertIn("261111 x.md", errors[0])
             attempts = len(calls)
             self.index.rescan_dirs([str(self.root / "sub")])
-            pump(1.6)
+            wait_until(lambda: len(calls) >= attempts + 2, timeout=1.6)  # room for the retry cycle
             self.assertEqual(len(errors), 1)                             # same path is not announced again
             self.assertLessEqual(len(calls), attempts + 2)               # and no endless retry
         self.assertEqual(self.titles(D11), ["vault/sub/x"])              # the note itself is still shown
@@ -221,6 +226,59 @@ class IndexTest(unittest.TestCase):
     def test_missing_root_is_reported(self):
         self.index.set_folders([str(self.root), str(self.root.parent / "gone")])
         self.assertEqual(self.index.missing, [str(self.root.parent / "gone")])
+
+    def test_root_missing_at_start_is_read_when_it_appears(self):
+        late = self.root.parent / "late"
+        self.index.set_folders([str(self.root), str(late)])
+        self.assertTrue(self.index._revive.isActive())
+        self.index._check_missing()                                      # still not there
+        self.assertEqual(self.index.missing, [str(late)])
+        late.mkdir()
+        (late / "261111 a.md").write_text("x", "utf-8")
+        self.index._check_missing()
+        self.assertEqual((self.index.missing, self.titles(D11)), ([], ["late/a"]))
+        self.assertIn(norm(late), self.index.watched())
+        self.assertFalse(self.index._revive.isActive())
+
+    def test_deleted_root_is_reported_once_and_recovers(self):
+        errors = []
+        self.index.scanError.connect(errors.append)
+        other = self.root.parent / "other"
+        other.mkdir()
+        (other / "261110 o.md").write_text("x", "utf-8")
+        self.index.set_folders([str(self.root), str(other)])
+        shutil.rmtree(other)
+        self.index.rescan_dirs([str(other)])
+        self.index.rescan_dirs([str(other)])
+        self.assertEqual((self.index.missing, len(errors)), ([str(other)], 1))
+        self.assertEqual(self.titles(D10), ["vault/sub/회의"])            # the other root is untouched
+        self.assertTrue(self.index._revive.isActive())
+        other.mkdir()
+        (other / "261111 back.md").write_text("x", "utf-8")
+        with self.failing_scandir(other):                                # back but not readable yet
+            self.index._check_missing()
+            self.index._check_missing()
+        self.assertEqual(self.index.missing, [str(other)])
+        self.assertLessEqual(len(self.index.scan_errors), 2)             # polling must not pile up errors
+        self.index._check_missing()
+        self.assertEqual((self.index.missing, self.titles(D11)), ([], ["other/back"]))
+        self.assertIn(norm(other / "261111 back.md"), self.index.watched())
+        (other / "261111 more.md").write_text("x", "utf-8")              # and it is really watched again
+        self.assertTrue(wait_until(lambda: len(self.titles(D11)) == 2))
+
+    def test_file_that_cannot_be_checked_keeps_its_note(self):
+        locked = self.root / "sub" / "261110 회의.md"
+        self.index.notes(D10)                                            # loaded once
+        real = Path.stat
+
+        def stat(path, **kw):
+            if norm(path) == norm(locked):
+                raise PermissionError(13, "locked", str(path))
+            return real(path, **kw)
+        with mock.patch.object(Path, "stat", stat):
+            self.index.rescan_dirs([str(self.root / "sub")])
+        self.assertEqual(self.titles(D10), ["vault/sub/회의"])
+        self.assertEqual(len(self.index.scan_errors), 1)
 
 
 if __name__ == "__main__":
