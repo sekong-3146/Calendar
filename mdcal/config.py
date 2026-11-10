@@ -24,6 +24,8 @@ def _defaults():
         "carry_mode": "manual",   # auto, manual, or off
         "carry_lookback_days": 14, # past days checked for open tasks
         "last_carry": None,        # last successful auto carry, ISO date
+        "peek_hotkey": "ctrl+alt+c",  # lifts the calendar above all windows; "" disables
+        "pin_debug": False,        # log every foreground/desktop state change to pin.log
     }
 
 

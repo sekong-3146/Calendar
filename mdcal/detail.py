@@ -286,6 +286,24 @@ class DayDetail(QWidget):
         self.memo.setTextCursor(saved)
         return True
 
+    def append_task(self, text: str) -> bool:
+        """Add '- [ ] text' at the end of the open memo (one undo step). False if read-only."""
+        if self.memo.isReadOnly():
+            return False
+        QGuiApplication.inputMethod().commit()
+        pos = self.memo.textCursor().position()
+        new = tasks.append_task(self.memo.toPlainText(), text).rstrip("\n")
+        cursor = QTextCursor(self.memo.document())
+        cursor.beginEditBlock()
+        try:
+            cursor.select(QTextCursor.Document)
+            cursor.insertText(new)
+        finally:
+            cursor.endEditBlock()
+        cursor.setPosition(min(pos, self.memo.document().characterCount() - 1))
+        self.memo.setTextCursor(cursor)
+        return True
+
     def _shift_day(self, delta):
         if self.day is not None:
             self.show_day(self.day + timedelta(days=delta))

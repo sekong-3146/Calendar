@@ -113,9 +113,16 @@ class MdNote:
         return [f"{self.folder}/{first}"] + rest
 
 
+@dataclass
+class _Dir:
+    path: str                      # as scanned (original case)
+    notes: list
+
+
 class MdIndex(QObject):
     """Keeps {date: [MdNote]} for configured folders and emits changed on edits."""
     changed = Signal()
+    scanError = Signal(str)          # a folder became unreadable during a background rescan
 
     def __init__(self, folders, memo_folder=None, parent=None):
         super().__init__(parent)
@@ -125,11 +132,18 @@ class MdIndex(QObject):
         self.missing = []            # configured folders that do not exist
         self.scan_errors = []       # surfaced on startup and explicit refresh only
         self._cache = {}             # path -> MdNote (reuse parsed content if mtime same)
+        self._dirs = {}              # norm(dir) -> _Dir; lets one folder be rescanned alone
+        self._previous = {}          # _dirs of the last scan, only while a full rescan runs
+        self._unreadable = set()     # folders that exist but could not be read (reported once)
+        self._quiet = False          # True during a full rescan: no scanError signals
+        self._watch_retry = set()    # paths whose watch registration failed on the last rebuild
+        self._watch_reported = set() # ...and whose final failure the user was already told about
+        self._pending = set()        # changed folders waiting for the debounce
         self._watcher = QFileSystemWatcher(self)
         self._watcher.directoryChanged.connect(self._schedule)
-        self._watcher.fileChanged.connect(self._schedule)
+        self._watcher.fileChanged.connect(lambda p: self._schedule(os.path.dirname(os.path.normpath(p))))
         self._debounce = QTimer(self, singleShot=True, interval=500)
-        self._debounce.timeout.connect(self.rescan)
+        self._debounce.timeout.connect(self._flush_pending)
 
     def set_folders(self, folders):
         self.folders = list(folders)
@@ -147,71 +161,214 @@ class MdIndex(QObject):
                 roots.append(f)
         return roots
 
-    def _schedule(self, *_):
+    def _schedule(self, path):
+        self._pending.add(os.path.normpath(path))
         self._debounce.start()
+
+    def _flush_pending(self):
+        paths, self._pending = self._pending, set()
+        self.rescan_dirs(paths)
 
     def memo_path(self, day: date):
         return Path(self.memo_folder) / f"{day:%y%m%d}.md" if self.memo_folder else None
 
+    def refresh_memos(self):
+        """Pick up a memo file we just wrote without waiting for the watcher."""
+        if self.memo_folder:
+            self.rescan_dirs([self.memo_folder])
+
     def rescan(self):
-        by_day, dirs, files, cache = {}, [], [], {}
-        roots = self._roots()
+        """Full scan of every configured folder (startup, manual refresh, folder list change)."""
+        self._debounce.stop()
+        self._pending.clear()
         self.missing = []
         self.scan_errors = []
+        self._previous, self._dirs = self._dirs, {}
+        self._quiet = True               # the caller shows scan_errors itself after a full scan
+        try:
+            for root in self._roots():
+                try:
+                    is_dir = stat.S_ISDIR(os.stat(root).st_mode)
+                except FileNotFoundError:
+                    self.missing.append(root)
+                    continue
+                except OSError as e:
+                    self._scan_failed(root, e)
+                    continue
+                if not is_dir:
+                    self.missing.append(root)
+                    continue
+                self._walk(root, root)
+        finally:
+            self._previous, self._quiet = {}, False
+        self._rebuild(rewatch=set(self._dirs))
 
-        def scan_error(error):
-            if not isinstance(error, FileNotFoundError):
-                self.scan_errors.append(str(error))
-
-        for root in roots:
+    def rescan_dirs(self, paths):
+        """Rescan only these folders (not their unchanged subfolders). Unknown paths are ignored."""
+        touched = set()
+        live = {norm(p) for p in self._watcher.directories()}
+        for path in paths:
+            key = norm(path)
+            root = self._root_of(key)
+            if root is None:
+                continue
+            known = {k for k, d in self._dirs.items() if k != key and norm(os.path.dirname(d.path)) == key}
             try:
-                is_dir = stat.S_ISDIR(os.stat(root).st_mode)
+                subdirs = self._scan_dir(root, os.path.normpath(str(path)))
             except FileNotFoundError:
-                self.missing.append(root)
+                self._drop(key)                      # folder is gone
                 continue
             except OSError as e:
-                self.scan_errors.append(f"{root}: {e}")
+                self._scan_failed(path, e)           # unreadable right now: keep contents and watches
                 continue
-            if not is_dir:
-                self.missing.append(root)
+            touched.add(key)
+            found = {norm(s) for s in subdirs}
+            for k in known - found:
+                self._drop(k)
+            for s in subdirs:
+                # New subfolder, one deleted and recreated (its watch died with the old folder),
+                # or one whose last read failed (its kept contents may be stale).
+                if norm(s) not in self._dirs or norm(s) not in live or norm(s) in self._unreadable:
+                    touched.update(self._rewalk(root, s))
+        self.scan_errors = list(dict.fromkeys(self.scan_errors))[-50:]
+        self._rebuild(rewatch=touched)
+
+    @staticmethod
+    def _under(key, parent):
+        """key is parent or below it. rstrip: a drive root ('d:\\') already ends with a separator."""
+        return key == parent or key.startswith(parent.rstrip(os.sep) + os.sep)
+
+    def _root_of(self, key):
+        for root in self._roots():
+            if self._under(key, norm(root)):
+                return root
+        return None
+
+    def _drop(self, key):
+        for k in [k for k in self._dirs if self._under(k, key)]:
+            del self._dirs[k]
+        self._unreadable = {k for k in self._unreadable if not self._under(k, key)}
+
+    def _rewalk(self, root, start):
+        """Replace the subtree at start with a fresh walk. Parts that cannot be read keep their
+        old contents (via _previous), and their 'already reported' mark, instead of vanishing."""
+        key = norm(start)
+        self._previous = {k: d for k, d in self._dirs.items() if self._under(k, key)}
+        for k in self._previous:
+            del self._dirs[k]
+        try:
+            return self._walk(root, start)
+        finally:
+            self._previous = {}
+
+    def _scan_failed(self, path, error):
+        """A folder exists but cannot be read. Not treated as deleted; reported once per folder."""
+        key = norm(path)
+        self.scan_errors.append(f"{path}: {error}")
+        for k, d in self._previous.items():          # full scan: keep what we knew below it
+            if self._under(k, key):
+                self._dirs.setdefault(k, d)
+        if key not in self._unreadable:
+            self._unreadable.add(key)
+            if not self._quiet:
+                self.scanError.emit(f"폴더를 읽을 수 없습니다 (마지막으로 읽은 내용 유지)\n{path}\n{error}")
+
+    def _walk(self, root, start):
+        """Scan start and everything below it. Returns the keys scanned."""
+        keys, stack = set(), [start]
+        while stack:
+            cur = stack.pop()
+            try:
+                subdirs = self._scan_dir(root, cur)
+            except FileNotFoundError:
+                continue                             # Removed while walking.
+            except OSError as e:
+                self._scan_failed(cur, e)
                 continue
-            base = Path(root).name
-            for cur, subdirs, names in os.walk(root, onerror=scan_error):
-                subdirs[:] = [d for d in subdirs if not d.startswith(".")]   # .obsidian, .trash, .git
-                dirs.append(cur)
-                rel = os.path.relpath(cur, root)
-                folder = base if rel == "." else f"{base}/{rel.replace(os.sep, '/')}"
-                for n in names:
-                    if not n.lower().endswith(".md"):
-                        continue
-                    p = Path(cur) / n
-                    day, label = date_from_name(p.stem)
-                    if day is None:
-                        continue
-                    try:
-                        mtime = p.stat().st_mtime
-                    except FileNotFoundError:
-                        continue         # Removed between walk and stat.
-                    except OSError as e:
-                        self.scan_errors.append(f"{p}: {e}")
-                        continue
-                    old = self._cache.get(p)
-                    note = old if old and old.mtime == mtime else MdNote(p, day, label, folder, mtime)
-                    cache[p] = note
-                    by_day.setdefault(day, []).append(note)
-                    files.append(str(p))
+            keys.add(norm(cur))
+            stack.extend(subdirs)
+        return keys
+
+    def _scan_dir(self, root, cur):
+        """Read one folder into self._dirs and return its subfolder paths. Raises OSError if unreadable."""
+        with os.scandir(cur) as it:
+            entries = list(it)
+        base = Path(root).name or str(root)          # drive root has no name
+        rel = os.path.relpath(cur, root)
+        folder = base if rel == "." else f"{base}/{rel.replace(os.sep, '/')}"
+        notes, subdirs = [], []
+        for entry in entries:
+            name = entry.name
+            try:
+                if entry.is_junction():
+                    continue                         # like os.walk: never descend through links (cycles)
+                if entry.is_dir(follow_symlinks=False):
+                    if not name.startswith("."):     # .obsidian, .trash, .git
+                        subdirs.append(entry.path)
+                    continue
+                if not name.lower().endswith(".md") or not entry.is_file():
+                    continue
+                p = Path(entry.path)
+                day, label = date_from_name(p.stem)
+                if day is None:
+                    continue
+                mtime = p.stat().st_mtime
+            except FileNotFoundError:
+                continue                             # Removed between listing and stat.
+            except OSError as e:
+                self.scan_errors.append(f"{entry.path}: {e}")
+                continue
+            old = self._cache.get(p)
+            notes.append(old if old and old.mtime == mtime else MdNote(p, day, label, folder, mtime))
+        self._dirs[norm(cur)] = _Dir(cur, notes)
+        self._unreadable.discard(norm(cur))
+        return subdirs
+
+    def watched(self):
+        """Paths the OS watcher really holds, normalized (not what we asked for)."""
+        return {norm(p) for p in self._watcher.directories() + self._watcher.files()}
+
+    def _rebuild(self, rewatch):
+        """Recompute by_day from self._dirs and sync the watcher. rewatch: folder keys just scanned."""
+        by_day, cache, wanted = {}, {}, {}
+        for d in self._dirs.values():
+            wanted[norm(d.path)] = d.path
+            for note in d.notes:
+                cache[note.path] = note
+                by_day.setdefault(note.day, []).append(note)
+                wanted[norm(note.path)] = str(note.path)
         for notes in by_day.values():
             notes.sort(key=lambda x: (x.label != "", x.path.name))   # plain daily note first
         self._cache, self.by_day = cache, by_day
-        self._rewatch(dirs + files)
+        # Compare with what the watcher really holds: it drops deleted folders/files by itself.
+        live = {norm(p): p for p in self._watcher.directories() + self._watcher.files()}
+        # A replaced file (tmp -> rename, as we and Obsidian save) can lose its watch while still
+        # listed, so files of the folders just scanned are always re-added.
+        again = {norm(n.path) for k in rewatch if k in self._dirs for n in self._dirs[k].notes}
+        remove = [p for k, p in live.items() if k not in wanted or k in again]
+        if remove:
+            self._watcher.removePaths(remove)
+        add = [p for k, p in wanted.items() if k not in live or k in again]
+        failed = {norm(p): p for p in (self._watcher.addPaths(add) if add else [])}
+        # The watcher forgets a deleted path only after its own event is processed; until then
+        # it refuses to add the recreated path. Try once more after the debounce, then report.
+        gave_up = []
+        for k, p in failed.items():
+            if not os.path.exists(p):
+                continue                             # vanished meanwhile: nothing to watch
+            if k not in self._watch_retry:
+                self._schedule(p if os.path.isdir(p) else os.path.dirname(p))
+                continue
+            self.scan_errors.append(f"변경 감시 등록 실패: {p}")
+            if k not in self._watch_reported:
+                gave_up.append(p)
+        self._watch_retry = set(failed)
+        self._watch_reported = (self._watch_reported & set(failed)) | {norm(p) for p in gave_up}
+        if gave_up:                                  # one message, each path reported once
+            more = f"\n외 {len(gave_up) - 3}개" if len(gave_up) > 3 else ""
+            self.scanError.emit("변경 감시를 등록하지 못했습니다 (새로고침해야 반영됨)\n"
+                                + "\n".join(gave_up[:3]) + more)
         self.changed.emit()
-
-    def _rewatch(self, paths):
-        old = self._watcher.directories() + self._watcher.files()
-        if old:
-            self._watcher.removePaths(old)
-        if paths:
-            self._watcher.addPaths(paths)
 
     def _all(self, day):
         notes = self.by_day.get(day, [])

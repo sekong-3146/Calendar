@@ -64,10 +64,11 @@ class App:
 
         self.index.changed.connect(self.win.refresh)
         self.index.changed.connect(self.detail.reload_notes)
-        self.detail.saved.connect(lambda _d: self.index.rescan())   # pick up the new file mtime now
+        self.detail.saved.connect(lambda _d: self.index.refresh_memos())   # pick up the new file mtime now
         self.win.grid.dayActivated.connect(
             lambda d: self.detail.show_day(d, self.win.grid.cell_global_rect(d)))
         self.win.grid.taskToggled.connect(self._on_task_toggled)
+        self.win.grid.taskAdded.connect(self._on_task_added)
         self.win.grid.carryRequested.connect(lambda d: self._run_carry([d], date.today(), manual=True))
         self.win.dateChanged.connect(lambda _d: self._auto_carry())
         self.win.dateChanged.connect(lambda _d: self._refresh_icon())
@@ -82,6 +83,8 @@ class App:
         self.menu = QMenu()
         self.menu.aboutToShow.connect(self._build_menu)
         self.tray.setContextMenu(self.menu)
+        # Background rescans cannot show a dialog; a folder that became unreadable is reported once here.
+        self.index.scanError.connect(lambda msg: self.tray.showMessage("MdCal", msg, QSystemTrayIcon.Warning))
         self.win.btn_menu.setMenu(self.menu)     # header ☰ shows the same menu
 
         if warn:
@@ -127,16 +130,38 @@ class App:
             self.memos.write(d, new, doc.mtime)
         except ValueError as e:
             QMessageBox.warning(self.win, "MdCal", str(e))
-            self.index.rescan()
+            self.index.refresh_memos()
             return
         except MemoConflict:
             QMessageBox.warning(self.win, "MdCal", "메모 파일이 다른 곳에서 변경되었습니다. 다시 시도하세요.")
-            self.index.rescan()
+            self.index.refresh_memos()
             return
         except OSError as e:
             QMessageBox.warning(self.win, "MdCal", f"할 일 변경 실패\n{e}")
             return
-        self.index.rescan()
+        self.index.refresh_memos()
+
+    def _on_task_added(self, d, text):
+        """Quick add from a day cell: append '- [ ] text' to that day's memo."""
+        lost = f"\n입력한 내용: {text}"      # the cell box is already cleared; let the user copy it back
+        if not self.memos.enabled:
+            QMessageBox.warning(self.win, "MdCal", "메모 저장 폴더를 사용할 수 없습니다." + lost)
+            return
+        if self.detail.isVisible() and self.detail.day == d:
+            if not self.detail.append_task(text):
+                QMessageBox.warning(self.win, "MdCal", "읽기 전용 메모에는 추가할 수 없습니다." + lost)
+            return
+        try:
+            doc = self.memos.read(d)
+            if doc.error:
+                QMessageBox.warning(self.win, "MdCal", f"메모를 수정할 수 없습니다.\n{doc.error}" + lost)
+                return
+            self.memos.write(d, tasks.append_task(doc.body, text), doc.mtime)
+        except MemoConflict:
+            QMessageBox.warning(self.win, "MdCal", "메모 파일이 다른 곳에서 변경되었습니다. 다시 시도하세요." + lost)
+        except OSError as e:
+            QMessageBox.warning(self.win, "MdCal", f"할 일 추가 실패\n{e}" + lost)
+        self.index.refresh_memos()
 
     def _run_carry(self, sources, target, manual: bool):
         if not self.memos.enabled:
@@ -149,7 +174,7 @@ class App:
                 QMessageBox.warning(self.win, "MdCal", "저장되지 않은 메모가 있어 넘기기를 중단했습니다")
                 return False
         result = carry.carry(self.memos, sources, target)
-        self.index.rescan()
+        self.index.refresh_memos()
         self.detail.reload_notes()
         if result.errors:
             QMessageBox.warning(self.win, "MdCal",
@@ -237,6 +262,8 @@ class App:
         m.clear()
         m.addAction("보이기" if not self.win.isVisible() else "숨기기", self._toggle_visible)
         m.addAction("오늘로", self.win.go_today)
+        hotkey = self.cfg.get("peek_hotkey")
+        m.addAction("맨 위로 잠깐 보기" + (f"  ({hotkey})" if hotkey else ""), self.win.toggle_peek)
         m.addAction("새로고침", self._refresh)
         m.addSeparator()
 

@@ -5,12 +5,12 @@ from html import escape
 
 from PySide6.QtCore import QEvent, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QPen
-from PySide6.QtWidgets import (QHBoxLayout, QLabel, QMenu, QMessageBox, QSizeGrip, QToolButton, QToolTip,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QSizeGrip, QToolButton,
+                               QToolTip, QVBoxLayout, QWidget)
 
 from . import tasks
 from .config import APP_DIR, update_config
-from .winpin import WM_EXITSIZEMOVE, BottomPin, message_id, restore_no_activate
+from .winpin import WM_EXITSIZEMOVE, WM_HOTKEY, BottomPin, message_id, register_hotkey, restore_no_activate
 
 FONT = "Malgun Gothic"
 C_BG = QColor(22, 24, 30)
@@ -53,10 +53,21 @@ class GridWidget(QWidget):
     colorRequested = Signal(object, object)  # date, "#rrggbb" or None
     taskToggled = Signal(object, int, str)    # date, body line number, raw line
     carryRequested = Signal(object)          # source date
+    taskAdded = Signal(object, str)          # date, text typed into the cell's quick-add box
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
+        self.selected = None                 # date whose quick-add box is open
+        # A real line edit (not key handling on the grid) so Korean IME input works from the first key.
+        self._quick = QLineEdit(self)
+        self._quick.setPlaceholderText("할 일 추가 (Enter)")
+        self._quick.setStyleSheet(
+            "QLineEdit{background:#1B1E25;color:#E8EAED;border:1px solid #FFC857;border-radius:3px;"
+            "padding:0 3px;font:8pt 'Malgun Gothic'}")
+        self._quick.hide()
+        self._quick.returnPressed.connect(self._quick_commit)
+        self._quick.installEventFilter(self)
         self.month = 1
         self.sunday_first = True
         self.cells = []
@@ -66,6 +77,7 @@ class GridWidget(QWidget):
         self._task_rects = []                # QRectF, date, body line number, raw line
         self._pressed_task = None            # Preserve the first click across a rescan.
         self.carry_menu = True               # False when carry_mode is "off" (set by app)
+        self.quick_add = True                # click a cell to type a task (set by app)
         self.f_head = QFont(FONT, 9)
         self.f_day = QFont(FONT, 10, QFont.Bold)
         self.f_text = QFont(FONT, 8)
@@ -76,7 +88,53 @@ class GridWidget(QWidget):
         self._task_rects.clear()
         self.unsetCursor()
         QToolTip.hideText()
+        self._place_quick()
         self.update()
+
+    # quick add: click a cell, type, Enter -> '- [ ] text' in that day's memo
+    def _place_quick(self):
+        if self.selected not in self.cells:
+            self.close_quick()
+            return
+        r = self.cell_rect(self.cells.index(self.selected)).toRect()
+        h = QFontMetrics(self._quick.font()).height() + 6
+        self._quick.setGeometry(r.left() + 3, r.bottom() - h - 2, r.width() - 6, h)
+
+    def open_quick(self, day):
+        if day != self.selected:
+            self._quick.clear()              # an unsent draft never moves to another date
+        self.selected = day
+        self._place_quick()
+        self._quick.show()
+        self._quick.setFocus()
+        self.update()
+
+    def close_quick(self):
+        if self.selected is None and self._quick.isHidden():
+            return
+        self.selected = None
+        self._quick.hide()
+        self._quick.clear()
+        self.update()
+
+    def _quick_commit(self):
+        text = self._quick.text().strip()
+        if text and self.selected is not None:
+            self._quick.clear()              # stays open for the next item
+            self.taskAdded.emit(self.selected, text)
+
+    def eventFilter(self, watched, e):
+        if watched is self._quick:
+            if e.type() == QEvent.KeyPress and e.key() == Qt.Key_Escape:
+                self.close_quick()
+                return True
+            if e.type() == QEvent.FocusOut and e.reason() != Qt.PopupFocusReason:
+                self.close_quick()           # clicked elsewhere: unsent text is dropped
+        return super().eventFilter(watched, e)
+
+    def resizeEvent(self, e):
+        self._place_quick()
+        super().resizeEvent(e)
 
     # geometry
     def _cell_size(self):
@@ -139,6 +197,8 @@ class GridWidget(QWidget):
             p.setPen(QPen(C_TODAY, 1.6))
             p.setBrush(Qt.NoBrush)
             p.drawRoundedRect(r.adjusted(2, 2, -2, -2), 4, 4)
+        if d == self.selected:
+            p.fillRect(inner, C_HOVER)
 
         wd = d.weekday()
         base = C_SUN if wd == 6 else C_SAT if wd == 5 else C_TEXT
@@ -217,6 +277,11 @@ class GridWidget(QWidget):
             self.taskToggled.emit(*hit[1:])
             e.accept()
             return
+        idx = self._hit(e.position())
+        if e.button() == Qt.LeftButton and idx is not None and self.quick_add:
+            self.open_quick(self.cells[idx])
+            e.accept()
+            return
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
@@ -239,6 +304,7 @@ class GridWidget(QWidget):
             e.accept()
             return
         if idx is not None and e.button() == Qt.LeftButton:
+            self.close_quick()
             self.dayActivated.emit(self.cells[idx])
 
     def contextMenuEvent(self, e):
@@ -492,13 +558,33 @@ class CalendarWindow(QWidget):
             self.pin = BottomPin(int(self.winId()), self.raisedChanged.emit,
                                  log_path=str(APP_DIR / "pin.log"),
                                  on_log_error=lambda e: QMessageBox.warning(
-                                     self, "MdCal", f"pin.log 기록 실패 (기록 중지)\n{e}"))
+                                     self, "MdCal", f"pin.log 기록 실패 (기록 중지)\n{e}"),
+                                 verbose=bool(self.cfg.get("pin_debug")))
+            hotkey = self.cfg.get("peek_hotkey")
+            if hotkey:
+                try:
+                    register_hotkey(int(self.winId()), 1, hotkey)
+                except (ValueError, OSError) as e:
+                    QMessageBox.warning(self, "MdCal", f"미리보기 단축키({hotkey})를 등록하지 못했습니다.\n{e}")
         if not self.pin.raised:
             self.pin.send_to_bottom()
+
+    def toggle_peek(self):
+        """Hotkey: lift the calendar above all windows; again (or focusing another app) drops it."""
+        if self.pin is None or not self.isVisible():
+            return
+        if self.pin.raised:
+            self.pin.peek(False)
+            return
+        self.unminimize()
+        self.pin.peek(True)
+        self.activateWindow()            # so that clicking another app is what lowers it
 
     def nativeEvent(self, event_type, message):
         if self.pin is not None:
             self.pin.handle(int(message))
+        if message_id(int(message)) == WM_HOTKEY:
+            self.toggle_peek()
         if message_id(int(message)) == WM_EXITSIZEMOVE:
             # Save now: a monitor-change signal right after must not snap back to the old spot.
             self._save_geo.stop()
@@ -509,6 +595,8 @@ class CalendarWindow(QWidget):
         # No taskbar button, so a minimized calendar (Win+M, "minimize all") could not be brought back.
         if e.type() == QEvent.WindowStateChange and self.isMinimized():
             QTimer.singleShot(0, self.unminimize)
+        if e.type() == QEvent.ActivationChange and self.isActiveWindow() and self.pin is not None:
+            self.pin.activated()
         super().changeEvent(e)
 
     def unminimize(self):

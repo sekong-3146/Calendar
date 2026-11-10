@@ -11,7 +11,7 @@ OPEN, DONE, CARRIED = " ", "x", ">"
 
 _TASK_RE = re.compile(r"^(?P<indent>[ \t]*)(?P<bullet>[-*+]|\d+[.)])[ \t]+\[(?P<mark>[^\]])\](?:[ \t]+|$)(?P<text>.*)$")
 _LIST_RE = re.compile(r"^(?P<indent>[ \t]*)(?P<bullet>[-*+]|\d+[.)])[ \t]+(?P<text>.*)$")
-_FENCE_RE = re.compile(r"^[ \t]*(```|~~~)")
+_FENCE_RE = re.compile(r"^[ \t]*(?P<fence>`{3,}|~{3,})(?P<rest>.*)$")
 _HEAD_RE = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]|$)")
 _CARRY_SUFFIX_RE = re.compile(r"[ \t]*\(→ \d{1,2}/\d{1,2}\)[ \t]*$")
 
@@ -55,14 +55,35 @@ def parse_task(line: str, line_no: int = 0):
 
 def editable_mask(lines) -> list:
     """True where a line may be converted: not blank, not a heading, not inside/at a code fence."""
-    mask, in_fence = [], False
+    fenced, _ = _scan_fences(lines)
+    return [not f and bool(ln.strip()) and not _HEAD_RE.match(ln) for ln, f in zip(lines, fenced)]
+
+
+def _scan_fences(lines):
+    """(per-line True if fence delimiter or inside a fence, the fence still open at the end or None).
+    A fence closes only with the same character, at least as long, nothing after it,
+    and at most 3 spaces deeper than its opener."""
+    flags, open_fence, open_indent, list_indent = [], None, 0, None
     for ln in lines:
-        if _FENCE_RE.match(ln):
-            in_fence = not in_fence
-            mask.append(False)
-            continue
-        mask.append(not in_fence and bool(ln.strip()) and not _HEAD_RE.match(ln))
-    return mask
+        s = ln.rstrip("\r")
+        m = _FENCE_RE.match(s)
+        indent = len(s.expandtabs(4)) - len(s.expandtabs(4).lstrip(" "))
+        if open_fence is None:
+            # 4+ spaces is indented code, not a fence, unless it sits inside a list item.
+            in_reach = indent <= 3 or (list_indent is not None and indent > list_indent)
+            if m and in_reach and not (m["fence"][0] == "`" and "`" in m["rest"]):
+                open_fence, open_indent = m["fence"], indent
+            elif _LIST_RE.match(s):
+                list_indent = indent
+            elif s.strip() and indent == 0:
+                list_indent = None                   # a top-level paragraph ends the list
+            flags.append(open_fence is not None)
+        else:
+            flags.append(True)
+            if (m and m["fence"][0] == open_fence[0] and len(m["fence"]) >= len(open_fence)
+                    and not m["rest"].strip() and indent <= open_indent + 3):
+                open_fence = None
+    return flags, open_fence
 
 
 def tasks(body: str) -> list:
@@ -184,8 +205,19 @@ def append_open_tasks(body: str, texts) -> str:
     """Append '- [ ] text' lines at the end of body."""
     if not texts:
         return body
-    new = "\n".join(f"- [ ] {strip_carry_suffix(t).strip()}" for t in texts)
+    return _append_lines(body, [f"- [ ] {strip_carry_suffix(t).strip()}" for t in texts])
+
+
+def append_task(body: str, text: str) -> str:
+    """Append '- [ ] text' exactly as typed (quick add): no carry-suffix cleanup."""
+    text = text.strip()
+    return _append_lines(body, [f"- [ ] {text}"]) if text else body
+
+
+def _append_lines(body: str, new_lines) -> str:
+    new = "\n".join(new_lines)
     base = body.rstrip("\n")
-    if sum(1 for ln in split_lines(base) if _FENCE_RE.match(ln)) % 2:
-        base += "\n```"      # close an unclosed fence so appended tasks stay tasks (renders the same)
+    open_fence = _scan_fences(split_lines(base))[1]
+    if open_fence:
+        base += "\n" + open_fence    # close it with the same delimiter so the new lines stay tasks
     return (base + "\n" + new + "\n") if base.strip() else (new + "\n")
