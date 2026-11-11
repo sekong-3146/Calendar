@@ -17,6 +17,7 @@ _PATTERNS = [
 _H_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 REVIVE_MS = 5000                 # how often a missing configured folder is checked for its return
+WATCH_FAILED = "변경 감시 등록 실패"   # scan_errors prefix: contents were read, only the watch is missing
 
 
 def date_from_name(stem: str):
@@ -396,7 +397,7 @@ class MdIndex(QObject):
             if k not in self._watch_retry:
                 self._schedule(p if os.path.isdir(p) else os.path.dirname(p))
                 continue
-            self.scan_errors.append(f"변경 감시 등록 실패: {p}")
+            self.scan_errors.append(f"{WATCH_FAILED}: {p}")
             if k not in self._watch_reported:
                 gave_up.append(p)
         self._watch_retry = set(failed)

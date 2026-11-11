@@ -26,6 +26,7 @@ def _defaults():
         "last_carry": None,        # last successful auto carry, ISO date
         "peek_hotkey": "ctrl+alt+c",  # lifts the calendar above all windows; "" disables
         "pin_debug": False,        # log every foreground/desktop state change to pin.log
+        "export_folder": None,     # where the last period summary was saved
     }
 
 
@@ -65,7 +66,7 @@ def _valid(key, v) -> bool:
     """A hand-edited config.json must not reach paint or timer code with a wrong type."""
     if key == "md_folders":
         return isinstance(v, list) and all(isinstance(x, str) for x in v)
-    if key in ("memo_folder", "last_carry"):
+    if key in ("memo_folder", "last_carry", "export_folder"):
         return v is None or isinstance(v, str)
     if key == "geometry":
         return v is None or (isinstance(v, list) and len(v) == 4

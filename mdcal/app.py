@@ -2,18 +2,18 @@
 import os
 import sys
 import traceback
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from PySide6.QtCore import QLockFile, QRectF, Qt
 from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QMessageBox, QSystemTrayIcon
 
-from . import autostart, carry, tasks
+from . import autostart, carry, report, tasks
 from .config import APP_DIR, DB_PATH, LOCK_PATH, load_config, save_config, update_config
 from .detail import DayDetail
 from .grid import CalendarWindow
-from .mdsource import MdIndex
+from .mdsource import MdIndex, date_from_name
 from .memofile import MemoConflict, MemoFiles
 from .store import Store
 
@@ -89,6 +89,7 @@ class App:
         self.win.grid.taskToggled.connect(self._on_task_toggled)
         self.win.grid.taskAdded.connect(self._on_task_added)
         self.win.grid.carryRequested.connect(lambda d: self._run_carry([d], date.today(), manual=True))
+        self.win.grid.exportRequested.connect(self._export_report)
         self.win.dateChanged.connect(lambda _d: self._auto_carry())
         self.win.dateChanged.connect(lambda _d: self._refresh_icon())
         self.win.raisedChanged.connect(self.detail.set_topmost)
@@ -206,6 +207,58 @@ class App:
             self.tray.showMessage("MdCal", f"미완료 할 일 {result.moved}개를 오늘로 옮겼습니다")
         return True
 
+    def _export_report(self, start, end):
+        """Write the summary of start..end to a Markdown file the user picks."""
+        if self.detail.isVisible():
+            self.detail.flush()
+            if self.detail.has_unsaved:
+                QMessageBox.warning(self.win, "MdCal", "저장되지 않은 메모가 있어 내보내기를 중단했습니다")
+                return
+        self.index.rescan()              # full scan: fresh contents, and missing/scan_errors are current
+        rep = report.build_report(self.index, start, end)
+        if rep.empty:
+            if rep.unread:
+                QMessageBox.warning(self.win, "MdCal", "정리할 기록을 찾지 못했습니다. 다음을 확인하지 못했습니다:\n"
+                                    + "\n".join(rep.unread[:10]))
+            else:
+                QMessageBox.information(self.win, "MdCal", "선택한 기간에 정리할 기록이 없습니다.")
+            return
+        folder = self.cfg.get("export_folder")
+        if not folder or not os.path.isdir(folder):
+            folder = str(Path.home())
+        path, _ = QFileDialog.getSaveFileName(      # asks before replacing an existing file
+            None, "기간 정리 내보내기", os.path.join(folder, report.default_name(start, end)),
+            "Markdown (*.md)")
+        if not path:
+            return
+        path = os.path.normpath(path)
+        if date_from_name(Path(path).stem)[0] is not None:
+            answer = QMessageBox.question(
+                self.win, "MdCal",
+                "파일 이름이 날짜로 시작합니다. MD 폴더 안에 저장하면 달력에 그날의 노트로 표시됩니다.\n"
+                "그대로 저장할까요?")
+            if answer != QMessageBox.Yes:
+                return
+        try:
+            report.save_report(path, rep.text)
+        except OSError as e:
+            QMessageBox.warning(self.win, "MdCal", f"정리 파일 저장 실패\n{e}")
+            return
+        self.win.grid.clear_range()
+        missed = rep.errors + len(rep.unread)
+        failed = f"\n읽지 못한 곳 {missed}건이 있습니다 (파일에 표시)" if missed else ""
+        self.tray.showMessage("MdCal", f"정리를 저장했습니다 (완료 {rep.done}건, 노트 {rep.notes}개)"
+                                       f"{failed}\n{path}")
+        if os.path.dirname(path) != self.cfg.get("export_folder"):
+            self._set_cfg("export_folder", os.path.dirname(path), "내보내기 폴더")
+
+    def _export_month(self, months_back):
+        today = date.today()
+        m = today.year * 12 + today.month - 1 - months_back
+        first = date(m // 12, m % 12 + 1, 1)
+        last = date((m + 1) // 12, (m + 1) % 12 + 1, 1) - timedelta(days=1)
+        self._export_report(first, min(last, today))     # so the title shows the days really covered
+
     def _auto_carry(self):
         today = date.today()
         if (self.cfg.get("carry_mode", "manual") != "auto"
@@ -284,6 +337,11 @@ class App:
         hotkey = self.cfg.get("peek_hotkey")
         m.addAction("맨 위로 잠깐 보기" + (f"  ({hotkey})" if hotkey else ""), self.win.toggle_peek)
         m.addAction("새로고침", self._refresh)
+        em = m.addMenu("기간 정리 내보내기")
+        em.addAction("이번 달 (오늘까지)", lambda: self._export_month(0))
+        em.addAction("지난달", lambda: self._export_month(1))
+        em.addSeparator()
+        em.addAction("다른 기간: 달력에서 날짜를 끌어 선택 → 우클릭").setEnabled(False)
         m.addSeparator()
 
         fm = m.addMenu("MD 폴더")

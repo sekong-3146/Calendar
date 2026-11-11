@@ -22,6 +22,7 @@ C_TODAY = QColor(255, 200, 87)
 C_LINE = QColor(255, 255, 255, 26)
 C_MD = QColor(127, 209, 185)
 C_HOVER = QColor(255, 255, 255, 18)
+C_RANGE = QColor(255, 200, 87, 46)     # days selected by dragging
 HEAD_H = 22          # weekday row height
 
 DAY_COLORS = [("빨강", "#E5484D"), ("주황", "#F76B15"), ("노랑", "#FFC53D"),
@@ -54,11 +55,15 @@ class GridWidget(QWidget):
     taskToggled = Signal(object, int, str)    # date, body line number, raw line
     carryRequested = Signal(object)          # source date
     taskAdded = Signal(object, str)          # date, text typed into the cell's quick-add box
+    exportRequested = Signal(object, object) # first date, last date of the dragged range
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
         self.selected = None                 # date whose quick-add box is open
+        self.range = None                    # (first date, last date) selected by dragging
+        self._press_day = None               # cell the left button went down on
+        self._dragging = False               # the press has left its cell at least once
         # A real line edit (not key handling on the grid) so Korean IME input works from the first key.
         self._quick = QLineEdit(self)
         self._quick.setPlaceholderText("할 일 추가 (Enter)")
@@ -83,6 +88,9 @@ class GridWidget(QWidget):
         self.f_text = QFont(FONT, 8)
 
     def set_view(self, month, cells, data, sunday_first):
+        if cells != self.cells:              # another month: the selection is not carried along
+            self._press_day, self._dragging = None, False
+            self.range = None
         self.month, self.cells, self.data, self.sunday_first = month, cells, data, sunday_first
         self._truncated.clear()
         self._task_rects.clear()
@@ -199,6 +207,8 @@ class GridWidget(QWidget):
             p.drawRoundedRect(r.adjusted(2, 2, -2, -2), 4, 4)
         if d == self.selected:
             p.fillRect(inner, C_HOVER)
+        if self.in_range(d):
+            p.fillRect(inner, C_RANGE)
 
         wd = d.weekday()
         base = C_SUN if wd == 6 else C_SAT if wd == 5 else C_TEXT
@@ -270,26 +280,82 @@ class GridWidget(QWidget):
     def _task_hit(self, pos):
         return next((entry for entry in self._task_rects if entry[0].contains(pos)), None)
 
+    # range selection: drag across cells; right-click inside it offers the export
+    def in_range(self, d) -> bool:
+        return self.range is not None and self.range[0] <= d <= self.range[1]
+
+    def clear_range(self):
+        if self.range is not None:
+            self.range = None
+            self.update()
+
+    def _drag_to(self, pos):
+        """Extend the selection from the pressed cell to the cell under pos (clamped to the grid)."""
+        if self._press_day not in self.cells:
+            return
+        w, h = self._cell_size()
+        col = min(6, max(0, int(pos.x() / w)))
+        row = min(5, max(0, int((pos.y() - HEAD_H) / h)))
+        day = self.cells[row * 7 + col]
+        if not self._dragging:
+            if day == self._press_day:
+                return                       # still a click
+            self._dragging = True
+            self.close_quick()
+            self.setFocus()                  # so Esc reaches keyPressEvent
+        new = (min(day, self._press_day), max(day, self._press_day))
+        if new != self.range:
+            self.range = new
+            self.update()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape and (self.range is not None or self._press_day is not None):
+            self._press_day, self._dragging = None, False
+            self.clear_range()
+            e.accept()
+            return
+        super().keyPressEvent(e)
+
     def mousePressEvent(self, e):
         hit = self._task_hit(e.position())
         self._pressed_task = hit if e.button() == Qt.LeftButton else None
-        if e.button() == Qt.LeftButton and hit is not None:
+        if e.button() != Qt.LeftButton:
+            super().mousePressEvent(e)
+            return
+        self._press_day, self._dragging = None, False
+        if hit is not None:                  # a checkbox never starts a drag
             self.taskToggled.emit(*hit[1:])
             e.accept()
             return
         idx = self._hit(e.position())
-        if e.button() == Qt.LeftButton and idx is not None and self.quick_add:
-            self.open_quick(self.cells[idx])
-            e.accept()
+        if idx is None:
+            self.clear_range()
+            super().mousePressEvent(e)
             return
-        super().mousePressEvent(e)
+        self._press_day = self.cells[idx]    # click or drag: decided on move/release
+        e.accept()
 
     def mouseMoveEvent(self, e):
+        if self._press_day is not None and e.buttons() & Qt.LeftButton:
+            self._drag_to(e.position())
         self.setCursor(Qt.PointingHandCursor if self._task_hit(e.position()) else Qt.ArrowCursor)
         idx = self._hit(e.position())
         if idx != self.hover:
             self.hover = idx
             self.update()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() != Qt.LeftButton or self._press_day is None:
+            super().mouseReleaseEvent(e)
+            return
+        day, dragged = self._press_day, self._dragging
+        self._press_day, self._dragging = None, False
+        e.accept()
+        if dragged:
+            return                           # the selection stays until cleared
+        self.clear_range()                   # a plain click drops the selection
+        if self.quick_add and day in self.cells:
+            self.open_quick(day)
 
     def leaveEvent(self, _):
         self.hover = None
@@ -311,8 +377,17 @@ class GridWidget(QWidget):
         idx = self._hit(e.pos())
         if idx is None:
             return
-        d = self.cells[idx]
+        self._context_menu(self.cells[idx]).exec(e.globalPos())
+
+    def _context_menu(self, d) -> QMenu:
         m = QMenu(self)
+        if self.in_range(d):                 # only range actions: day actions here would be ambiguous
+            a, b = self.range
+            label = f"{a.month}/{a.day}" + (f" ~ {b.month}/{b.day}" if a != b else "")
+            m.addAction(f"{label} 정리 내보내기…", lambda: self.exportRequested.emit(a, b))
+            m.addAction("선택 해제", self.clear_range)
+            return m
+        self.clear_range()
         m.addAction("열기 / 메모 쓰기", lambda: self.dayActivated.emit(d))
         cd = self.data.get(d)
         count = len(tasks.open_tasks(cd.memo)) if self.carry_menu and cd and d < date.today() else 0
@@ -322,7 +397,7 @@ class GridWidget(QWidget):
         for name, hexv in DAY_COLORS:
             m.addAction(name, lambda h=hexv: self.colorRequested.emit(d, h))
         m.addAction("색 지우기", lambda: self.colorRequested.emit(d, None))
-        m.exec(e.globalPos())
+        return m
 
 
 class HeaderBar(QWidget):

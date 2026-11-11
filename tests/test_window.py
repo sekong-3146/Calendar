@@ -161,11 +161,113 @@ class WindowTest(Base):
         self.assertEqual(len(calls), 1)
 
     # quick add
-    def click(self, day):
+    def mouse(self, kind, pos, button=Qt.LeftButton, held=Qt.LeftButton):
         g = self.win.grid
-        pos = g.cell_rect(g.cells.index(day)).center()
-        g.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, pos, g.mapToGlobal(pos),
-                                      Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+        e = QMouseEvent(kind, QPointF(pos), QPointF(g.mapToGlobal(pos.toPoint())), button, held, Qt.NoModifier)
+        {QEvent.MouseButtonPress: g.mousePressEvent, QEvent.MouseMove: g.mouseMoveEvent,
+         QEvent.MouseButtonRelease: g.mouseReleaseEvent}[kind](e)
+
+    def center(self, day):
+        g = self.win.grid
+        return g.cell_rect(g.cells.index(day)).center()
+
+    def click(self, day):
+        self.mouse(QEvent.MouseButtonPress, self.center(day))
+        self.mouse(QEvent.MouseButtonRelease, self.center(day), held=Qt.NoButton)
+
+    def drag(self, start, end, release=True):
+        self.mouse(QEvent.MouseButtonPress, self.center(start))
+        self.mouse(QEvent.MouseMove, self.center(end), button=Qt.NoButton)
+        if release:
+            self.mouse(QEvent.MouseButtonRelease, self.center(end), held=Qt.NoButton)
+
+    def menu_labels(self, day):
+        menu = self.win.grid._context_menu(day)
+        self.addCleanup(menu.deleteLater)
+        return menu, [a.text() for a in menu.actions() if not a.isSeparator()]
+
+    # range selection by dragging
+    def test_drag_selects_a_range_in_either_direction_and_keeps_it(self):
+        g = self.win.grid
+        g.resize(700, 600)
+        self.drag(date(2026, 11, 12), D10)
+        self.assertEqual(g.range, (D10, date(2026, 11, 12)))
+        self.assertTrue(g._quick.isHidden() and g.selected is None)      # a drag is not a quick add
+        self.assertTrue(g.in_range(date(2026, 11, 11)) and not g.in_range(date(2026, 11, 13)))
+        self.mouse(QEvent.MouseMove, self.center(date(2026, 11, 20)), button=Qt.NoButton, held=Qt.NoButton)
+        self.assertEqual(g.range, (D10, date(2026, 11, 12)))             # hovering later changes nothing
+
+    def test_drag_outside_the_grid_is_clamped(self):
+        g = self.win.grid
+        g.resize(700, 600)
+        self.mouse(QEvent.MouseButtonPress, self.center(D10))
+        self.mouse(QEvent.MouseMove, QPointF(-50, -50), button=Qt.NoButton)
+        self.assertEqual(g.range, (g.cells[0], D10))
+        self.mouse(QEvent.MouseMove, QPointF(5000, 5000), button=Qt.NoButton)
+        self.assertEqual(g.range, (D10, g.cells[-1]))
+
+    def test_right_click_inside_the_selection_offers_only_the_export(self):
+        g = self.win.grid
+        g.resize(700, 600)
+        asked = []
+        g.exportRequested.connect(lambda a, b: asked.append((a, b)))
+        self.drag(D10, date(2026, 11, 12))
+        menu, labels = self.menu_labels(date(2026, 11, 11))
+        self.assertEqual(labels, ["11/10 ~ 11/12 정리 내보내기…", "선택 해제"])
+        menu.actions()[0].trigger()
+        self.assertEqual(asked, [(D10, date(2026, 11, 12))])
+        self.assertIsNotNone(g.range)                                    # kept while the save dialog is up
+        menu.actions()[1].trigger()
+        self.assertIsNone(g.range)
+
+    def test_right_click_outside_the_selection_clears_it_and_shows_the_day_menu(self):
+        g = self.win.grid
+        g.resize(700, 600)
+        self.drag(D10, date(2026, 11, 12))
+        _, labels = self.menu_labels(date(2026, 11, 20))
+        self.assertEqual(labels[0], "열기 / 메모 쓰기")
+        self.assertIsNone(g.range)
+
+    def test_click_escape_and_month_change_clear_the_selection(self):
+        g = self.win.grid
+        g.resize(700, 600)
+        self.drag(D10, date(2026, 11, 12))
+        self.click(date(2026, 11, 20))
+        self.assertEqual((g.range, g.selected), (None, date(2026, 11, 20)))   # and it is a normal click
+        g.close_quick()
+        self.drag(D10, date(2026, 11, 12), release=False)
+        g.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
+        self.mouse(QEvent.MouseMove, self.center(date(2026, 11, 13)), button=Qt.NoButton)
+        self.mouse(QEvent.MouseButtonRelease, self.center(date(2026, 11, 13)), held=Qt.NoButton)
+        self.assertEqual((g.range, g.selected), (None, None))            # Esc ends the drag itself too
+        self.drag(D10, date(2026, 11, 12))
+        self.win.refresh()                                               # same month: a rescan keeps it
+        self.assertEqual(g.range, (D10, date(2026, 11, 12)))
+        self.win.shift_month(1)
+        self.assertIsNone(g.range)
+
+    def test_dragging_back_to_the_first_cell_selects_one_day(self):
+        g = self.win.grid
+        g.resize(700, 600)
+        self.mouse(QEvent.MouseButtonPress, self.center(D10))
+        self.mouse(QEvent.MouseMove, self.center(date(2026, 11, 11)), button=Qt.NoButton)
+        self.mouse(QEvent.MouseMove, self.center(D10), button=Qt.NoButton)
+        self.mouse(QEvent.MouseButtonRelease, self.center(D10), held=Qt.NoButton)
+        self.assertEqual((g.range, g.selected), ((D10, D10), None))
+        self.assertEqual(self.menu_labels(D10)[1][0], "11/10 정리 내보내기…")
+
+    def test_a_checkbox_press_never_starts_a_drag(self):
+        g = self.win.grid
+        g.resize(700, 600)
+        toggled = []
+        g.taskToggled.connect(lambda *a: toggled.append(a))
+        box = g.cell_rect(g.cells.index(D10)).adjusted(5, 22, -40, -40)
+        g._task_rects.append((box, D10, 0, "- [ ] a"))
+        self.mouse(QEvent.MouseButtonPress, box.center())
+        self.mouse(QEvent.MouseMove, self.center(date(2026, 11, 12)), button=Qt.NoButton)
+        self.mouse(QEvent.MouseButtonRelease, self.center(date(2026, 11, 12)), held=Qt.NoButton)
+        self.assertEqual(toggled, [(D10, 0, "- [ ] a")])
+        self.assertEqual((g.range, g.selected), (None, None))
 
     def test_quick_add_emits_task_and_stays_open(self):
         g = self.win.grid
